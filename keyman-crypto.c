@@ -99,21 +99,16 @@ int get_service_suite_password(char *password_buffer, size_t buffer_size) {
     unsigned char salt[SALT_SIZE];
     memcpy(salt, encrypted_data + 8, SALT_SIZE);
     
-    // Derive key and IV using PBKDF2
-    unsigned char key[32], iv[16];
-    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 32, key) != 1) {
+    // Derive key and IV using PBKDF2 (48 bytes total: 32 for key + 16 for IV)
+    unsigned char key_iv[48];
+    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         free(encrypted_data);
         secure_zero(skeleton_key, sizeof(skeleton_key));
         return EXIT_CRYPTO_ERROR;
     }
-    
-    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 16, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(encrypted_data);
-        secure_zero(skeleton_key, sizeof(skeleton_key));
-        return EXIT_CRYPTO_ERROR;
-    }
+    unsigned char *key = key_iv;
+    unsigned char *iv = key_iv + 32;
     
     // Initialize decryption
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
@@ -203,17 +198,14 @@ int encrypt_service_credentials(const char *service, const char *username, const
         return EXIT_CRYPTO_ERROR;
     }
     
-    // Derive key and IV
-    unsigned char key[32], iv[16];
-    if (PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 32, key) != 1) {
+    // Derive key and IV (48 bytes total: 32 for key + 16 for IV)
+    unsigned char key_iv[48];
+    if (PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv) != 1) {
         secure_zero(service_suite_password, sizeof(service_suite_password));
         return EXIT_CRYPTO_ERROR;
     }
-    
-    if (PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 16, iv) != 1) {
-        secure_zero(service_suite_password, sizeof(service_suite_password));
-        return EXIT_CRYPTO_ERROR;
-    }
+    unsigned char *key = key_iv;
+    unsigned char *iv = key_iv + 32;
     
     secure_zero(service_suite_password, sizeof(service_suite_password));
     
@@ -304,10 +296,11 @@ int reencrypt_service_credentials(const char *service, const char *new_suite_pas
     unsigned char salt[SALT_SIZE];
     memcpy(salt, encrypted_data + 8, SALT_SIZE);
     
-    // Derive key and IV using old password
-    unsigned char key[32], iv[16];
-    PKCS5_PBKDF2_HMAC(old_suite_password, strlen(old_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 32, key);
-    PKCS5_PBKDF2_HMAC(old_suite_password, strlen(old_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 16, iv);
+    // Derive key and IV using old password (48 bytes total: 32 for key + 16 for IV)
+    unsigned char key_iv[48];
+    PKCS5_PBKDF2_HMAC(old_suite_password, strlen(old_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv);
+    unsigned char *key = key_iv;
+    unsigned char *iv = key_iv + 32;
     
     secure_zero(old_suite_password, sizeof(old_suite_password));
     
@@ -404,15 +397,13 @@ int reencrypt_service_credentials(const char *service, const char *new_suite_pas
         return EXIT_CRYPTO_ERROR;
     }
     
-    // Derive key and IV with new password
-    unsigned char new_key[32], new_iv[16];
-    if (PKCS5_PBKDF2_HMAC(new_suite_password, strlen(new_suite_password), new_salt, SALT_SIZE, 10000, EVP_sha256(), 32, new_key) != 1) {
+    // Derive key and IV with new password (48 bytes total: 32 for key + 16 for IV)
+    unsigned char new_key_iv[48];
+    if (PKCS5_PBKDF2_HMAC(new_suite_password, strlen(new_suite_password), new_salt, SALT_SIZE, 10000, EVP_sha256(), 48, new_key_iv) != 1) {
         return EXIT_CRYPTO_ERROR;
     }
-    
-    if (PKCS5_PBKDF2_HMAC(new_suite_password, strlen(new_suite_password), new_salt, SALT_SIZE, 10000, EVP_sha256(), 16, new_iv) != 1) {
-        return EXIT_CRYPTO_ERROR;
-    }
+    unsigned char *new_key = new_key_iv;
+    unsigned char *new_iv = new_key_iv + 32;
     
     // Encrypt with new password
     ctx = EVP_CIPHER_CTX_new();
@@ -467,6 +458,82 @@ int reencrypt_service_credentials(const char *service, const char *new_suite_pas
 
 // Decrypt service credentials
 int decrypt_service_credentials(const char *service, const char *output_file) {
+    // Special case: service_suite is encrypted with skeleton key, not service suite password
+    if (strcmp(service, "service_suite") == 0) {
+        char skeleton_key[MAX_PASSWORD_LENGTH];
+        if (read_skeleton_key(skeleton_key, sizeof(skeleton_key)) != EXIT_SUCCESS) {
+            return EXIT_IO_ERROR;
+        }
+        
+        FILE *fp = fopen("/vault/.keys/service_suite.key", "rb");
+        if (!fp) {
+            secure_zero(skeleton_key, sizeof(skeleton_key));
+            fprintf(stderr, "ERROR: Cannot read service suite key\n");
+            return EXIT_IO_ERROR;
+        }
+        
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        
+        unsigned char *encrypted_data = malloc(file_size);
+        fread(encrypted_data, 1, file_size, fp);
+        fclose(fp);
+        
+        // Verify format and extract salt
+        if (file_size < 16 || memcmp(encrypted_data, "Salted__", 8) != 0) {
+            free(encrypted_data);
+            secure_zero(skeleton_key, sizeof(skeleton_key));
+            return EXIT_CRYPTO_ERROR;
+        }
+        
+        unsigned char salt[SALT_SIZE];
+        memcpy(salt, encrypted_data + 8, SALT_SIZE);
+        
+        // Derive key and IV using skeleton key (48 bytes total: 32 for key + 16 for IV)
+        unsigned char key_iv[48];
+        PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv);
+        unsigned char *key = key_iv;
+        unsigned char *iv = key_iv + 32;
+        
+        secure_zero(skeleton_key, sizeof(skeleton_key));
+        
+        // Decrypt
+        EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) {
+            free(encrypted_data);
+            return EXIT_CRYPTO_ERROR;
+        }
+        
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv);
+        
+        unsigned char *plaintext = malloc(file_size);
+        int len, plaintext_len;
+        
+        EVP_DecryptUpdate(ctx, plaintext, &len, encrypted_data + 16, file_size - 16);
+        plaintext_len = len;
+        
+        EVP_DecryptFinal_ex(ctx, plaintext + len, &len);
+        plaintext_len += len;
+        
+        EVP_CIPHER_CTX_free(ctx);
+        free(encrypted_data);
+        
+        // Write decrypted credentials to output file
+        fp = fopen(output_file, "w");
+        if (!fp) {
+            free(plaintext);
+            return EXIT_IO_ERROR;
+        }
+        
+        fwrite(plaintext, 1, plaintext_len, fp);
+        fclose(fp);
+        free(plaintext);
+        
+        return EXIT_SUCCESS;
+    }
+    
+    // Normal service key decryption using service suite password
     char service_suite_password[MAX_PASSWORD_LENGTH];
     if (get_service_suite_password(service_suite_password, sizeof(service_suite_password)) != EXIT_SUCCESS) {
         return EXIT_CRYPTO_ERROR;
@@ -501,10 +568,11 @@ int decrypt_service_credentials(const char *service, const char *output_file) {
     unsigned char salt[SALT_SIZE];
     memcpy(salt, encrypted_data + 8, SALT_SIZE);
     
-    // Derive key and IV
-    unsigned char key[32], iv[16];
-    PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 32, key);
-    PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 16, iv);
+    // Derive key and IV (48 bytes total: 32 for key + 16 for IV)
+    unsigned char key_iv[48];
+    PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv);
+    unsigned char *key = key_iv;
+    unsigned char *iv = key_iv + 32;
     
     secure_zero(service_suite_password, sizeof(service_suite_password));
     
@@ -581,19 +649,15 @@ int encrypt_suite_key(const char *input_file) {
         return EXIT_CRYPTO_ERROR;
     }
     
-    // Derive key and IV
-    unsigned char key[32], iv[16];
-    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 32, key) != 1) {
+    // Derive key and IV (48 bytes total: 32 for key + 16 for IV)
+    unsigned char key_iv[48];
+    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv) != 1) {
         free(content);
         secure_zero(skeleton_key, sizeof(skeleton_key));
         return EXIT_CRYPTO_ERROR;
     }
-    
-    if (PKCS5_PBKDF2_HMAC(skeleton_key, strlen(skeleton_key), salt, SALT_SIZE, 10000, EVP_sha256(), 16, iv) != 1) {
-        free(content);
-        secure_zero(skeleton_key, sizeof(skeleton_key));
-        return EXIT_CRYPTO_ERROR;
-    }
+    unsigned char *key = key_iv;
+    unsigned char *iv = key_iv + 32;
     
     secure_zero(skeleton_key, sizeof(skeleton_key));
     
