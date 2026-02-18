@@ -2,7 +2,27 @@
 
 # Source utility functions and paths
 source /vault/keyman/utils.sh
-# Function to list available key files
+
+# Non-interactive mode: delete a single key by service name (e.g. for backblazeTab bucket removal).
+# Usage: deletekey.sh <service_name>
+# service_name must contain only [a-zA-Z0-9_] (no path traversal, matches keyman keyfile naming).
+if [ -n "$1" ]; then
+    service_name="$1"
+    if [[ ! "$service_name" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        echo "Error: Service name must contain only letters, numbers, and underscores." >&2
+        exit 1
+    fi
+    key_file="${VAULT_DIR}/${service_name}.key"
+    if [ ! -f "$key_file" ]; then
+        echo "Error: Key file ${service_name}.key not found." >&2
+        exit 1
+    fi
+    secure_delete "$key_file"
+    echo "Key file $(basename "$key_file") has been securely deleted."
+    exit 0
+fi
+
+# Interactive mode: list keys and prompt for selection
 list_key_files() {
     echo "Select the key file to delete:"
     local i=1
@@ -13,12 +33,10 @@ list_key_files() {
     done
 }
 
-# Function to prompt for key file selection
 prompt_key_file_selection() {
     local key_index
     while true; do
         read -p "Enter the number corresponding to the key file: " key_index
-        # Validate input
         if [[ "$key_index" =~ ^[0-9]+$ ]] && (( key_index >= 1 && key_index <= ${#key_files[@]} )); then
             local selected_key_file="${key_files[$((key_index - 1))]}"
             echo "$selected_key_file"
@@ -29,11 +47,9 @@ prompt_key_file_selection() {
     done
 }
 
-# Main script logic
 list_key_files
 selected_key_file=$(prompt_key_file_selection)
 
-# Confirm deletion
 read -p "Are you sure you want to delete $(basename "$selected_key_file")? [y/N]: " confirm
 if [[ "$confirm" =~ ^[Yy]$ ]]; then
     secure_delete "$selected_key_file"
