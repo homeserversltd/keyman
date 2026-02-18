@@ -17,8 +17,8 @@ if [ -n "$1" ]; then
         echo "Error: Key file ${service_name}.key not found." >&2
         exit 1
     fi
-    secure_delete "$key_file"
-    echo "Key file $(basename "$key_file") has been securely deleted."
+    rm -f "$key_file"
+    echo "Key file $(basename "$key_file") deleted."
     exit 0
 fi
 
@@ -52,8 +52,8 @@ selected_key_file=$(prompt_key_file_selection)
 
 read -p "Are you sure you want to delete $(basename "$selected_key_file")? [y/N]: " confirm
 if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    secure_delete "$selected_key_file"
-    echo "Key file $(basename "$selected_key_file") has been securely deleted."
+    rm -f "$selected_key_file"
+    echo "Key file $(basename "$selected_key_file") deleted."
 else
     echo "Deletion cancelled."
 fi
