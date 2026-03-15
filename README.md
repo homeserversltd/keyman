@@ -1,129 +1,58 @@
-# Keyman Credential Management Suite v1.0.0
+# Keyman Key Management
 
-Enterprise-grade credential management system providing secure, encrypted storage and access to service credentials using AES-256-CBC encryption.
+Scripts and crypto for two-tier credential storage: skeleton.key (master) → service_suite.key → per-service keys. Runtime path on homeserver: `/vault/keyman/`. Source: `homeserver/initialization/startup/keyman/`.
 
-## Architecture
+## keystartup.sh – Safe manual run vs full deploy
 
-**Two-Tier Encryption Hierarchy:**
-```
-skeleton.key (master password) → service_suite.key → individual service credentials
-```
+**Do not run `keystartup.sh` without reading this if you are on a development machine or any system that is not a homeserver deploy.** The full flow changes the **admin (owner) user password** and writes to **/deploy/password.txt**. On a random system that can lock you out or overwrite data.
 
-**Components:**
-- **keyman-crypto**: C binary for cryptographic operations (AES-256-CBC + PBKDF2)
-- **Shell Scripts**: High-level credential management utilities  
-- **utils.sh**: Shared functions and configuration
+### Safe manual run (skeleton + keys only)
 
-## Quick Reference
-
-### Core Operations
-```bash
-# Create service credentials (any service name)
-newkey.sh <service_name> <username> <password>
-
-# Export credentials to ramdisk (15s auto-cleanup)
-exportkey.sh <service_name>
-
-# Delete credentials (interactive menu)
-deletekey.sh
-
-# Initialize system (run once as root)
-keystartup.sh
-```
-
-### Key Management
-```bash
-# Rotate encryption key for ALL services
-change_service_suite_key.sh
-
-# Update LUKS drive passwords  
-updateLuksKey.sh <drive_name> <old_password> <new_password>
-
-# Update Transmission credentials
-updateTransmissionKey.sh <new_password> <username>
-```
-
-## File Structure
-
-**Scripts:**
-- `keyman-crypto.c` - Cryptographic engine source
-- `keyman-crypto` - Compiled binary (build with `make`)
-- `Makefile` - Build configuration
-- `utils.sh` - Shared utilities
-- `newkey.sh` - Create credentials
-- `exportkey.sh` - Export to ramdisk
-- `change_service_suite_key.sh` - Rotate encryption keys
-- `updateTransmissionKey.sh` - Transmission-specific updates
-- `updateLuksKey.sh` - LUKS drive management  
-- `deletekey.sh` - Remove credentials
-- `keystartup.sh` - System initialization
-
-**Storage Locations:**
-```
-/root/key/skeleton.key              # Master password (plaintext)
-/vault/.keys/service_suite.key      # Encryption key (encrypted)
-/vault/.keys/<service>.key          # Service credentials (encrypted)
-/mnt/keyexchange/                   # Temporary export location (ramdisk)
-```
-
-## Security Features
-
-- **Encryption**: AES-256-CBC with PBKDF2 key derivation
-- **Runtime Protection**: Ramdisk-based access with automatic cleanup
-- **Access Control**: Restricted permissions (600/700), root-only access
-- **Memory Safety**: Secure cleanup in C binary, no persistent decrypted storage
-
-## Building & Installation
+Use this when you want to generate a skeleton key and key material **without** changing any system user password or touching `/deploy`:
 
 ```bash
-# Install dependencies (Arch Linux)
-sudo pacman -S gcc openssl
-
-# Build and install
-make && sudo make install
+# From a system where keyman is installed under /vault/keyman (e.g. homeserver or after install)
+sudo KEYMAN_MANUAL=1 /vault/keyman/keystartup.sh
 ```
 
-## Generic Service Support
+**What this does:**
 
-The system supports **any service name** - no predefined services required. Service names must be alphanumeric with underscores only. All services receive identical treatment.
+- Creates `/root/key` and `/vault/.keys` if needed
+- If `skeleton.key` is missing: generates a new master password, writes `skeleton.key`, prints it, and does **not** run `chpasswd` or write `/deploy/password.txt`
+- If `service_suite.key` is missing: creates it (and NAS key) from the skeleton key (best-effort match of full flow)
+- Prints clear warnings that the **full** deploy flow would set the admin (owner) user password to the generated key and write `/deploy/password.txt`
 
-## Environment Variables
+**What this does not do:**
 
-```bash
-DEBUG=true          # Enable debug logging
-BENCHMARK=true      # Enable timing metrics  
-AUTOMATED_SETUP=1   # Enable automated keystartup mode
-```
+- Does **not** set the root or owner (admin) user password
+- Does **not** create or write `/deploy` or `/deploy/password.txt`
 
-## Error Recovery
+**Requirements for manual run:**
 
-| Issue | Solution |
-|-------|----------|
-| Lost master password | Delete `skeleton.key`, run `keystartup.sh`, recreate all credentials |
-| Lost service suite key | Delete `service_suite.key`, run `keystartup.sh`, recreate all credentials |
-| Corrupted service credentials | Delete specific `.key` file, recreate with `newkey.sh` |
+- Script sources `/vault/keyman/utils.sh`. Either run on a system where keyman is installed at `/vault/keyman`, or temporarily symlink/copy the keyman tree there, or source `utils.sh` from the repo and set paths (advanced).
+- Run as root (script writes to `/root/key` and uses ramdisk at `/mnt/keyexchange`).
 
-## Usage Examples
+### Full deploy flow (homeserver only)
 
-```bash
-# Enterprise workflow
-newkey.sh jellyfin admin SecurePass123
-newkey.sh vaultwarden vault_admin VaultPass456
-exportkey.sh jellyfin  # Available at /mnt/keyexchange/jellyfin
+On a real homeserver deploy:
 
-# Custom applications
-newkey.sh my_app service_user MyAppPass789
-exportkey.sh my_app
+- **Automated:** `AUTOMATED_SETUP=1 /vault/keyman/keystartup.sh` (e.g. from bootstrap). Creates skeleton + service_suite + NAS keys, sets the **owner** user password to the master key (or `DEFAULT_ROOT_PASSWORD`), writes `/deploy/password.txt`.
+- **Interactive (recovery):** Run as root without `KEYMAN_MANUAL=1`. If `/deploy` exists, the script will set the owner password and write `/deploy/password.txt`. If `/deploy` does not exist, the script **does not** set any password (defensive); it only creates keys and warns.
 
-# Key rotation (affects all services)
-change_service_suite_key.sh --non-interactive current_pass new_pass
-```
+So: on a non-deploy machine, either use **KEYMAN_MANUAL=1** or rely on the script’s guard (no `/deploy` → no `chpasswd`/no `/deploy` write).
 
-## Professional Deployment Notes
+### Environment variables
 
-- Designed for production environments requiring credential isolation
-- Supports enterprise services (Jellyfin, Transmission, Vaultwarden, etc.)
-- Generic architecture allows integration with custom applications
-- Automated setup suitable for deployment scripts
-- Comprehensive logging and benchmarking for operations teams
+| Variable | Effect |
+|----------|--------|
+| `KEYMAN_MANUAL=1` | Safe manual mode: create skeleton (+ keys) only; never set admin password or write /deploy |
+| `AUTOMATED_SETUP=1` | Automated first-time setup (skeleton + keys + set owner password + /deploy/password.txt when not KEYMAN_MANUAL) |
+| `DEFAULT_ROOT_PASSWORD` | When set in full deploy mode, owner user gets this password instead of the skeleton key (misnomer: it is the admin/owner password, not root) |
+| `TEST_FLAG=1` | Skips setting admin password even in full deploy (for tests) |
 
+### Summary
+
+- **Manual run on dev / unknown system:** Use `KEYMAN_MANUAL=1` so the script only creates a skeleton key and keys, with warnings that the real deal sets owner and /deploy.
+- **Full flow** sets the **owner** (admin) user password and writes `/deploy/password.txt`; it does **not** set the root password. Root is unchanged.
+
+For other keyman commands (newkey, exportkey, deletekey, change_service_suite_key, LUKS/Transmission), see the Keyman skill (`.cursor/skills/keyman/SKILL.md`) and the main startup README.

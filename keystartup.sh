@@ -1,36 +1,56 @@
 #!/bin/bash
-#can delete the service_suite.key and run this script to default the service suite password to the master password
-#can delete the skeleton.key and run this script to generate a new master password, but know that all existing keys will be lost
-# Default root password - if empty, will use skeleton key
-# Read from environment variable if set, otherwise empty
+# Can delete service_suite.key and run this script to default the service suite password to the master password.
+# Can delete skeleton.key and run this script to generate a new master password; all existing keys will be lost.
+#
+# SAFE MANUAL RUN: Set KEYMAN_MANUAL=1 to only create skeleton.key (and keys); never change system passwords
+# or write /deploy. See README in this directory. Without KEYMAN_MANUAL=1, in deploy context this script
+# sets the admin (owner) user password and writes /deploy/password.txt.
+#
+# Default admin (owner) user password when in full deploy mode - if empty, admin gets the skeleton key as password.
 DEFAULT_ROOT_PASSWORD="${DEFAULT_ROOT_PASSWORD:-}"
-# Check if we're running in automated mode
 AUTOMATED_SETUP=${AUTOMATED_SETUP:-0}
-# Source utility functions
+KEYMAN_MANUAL=${KEYMAN_MANUAL:-0}
+# Source utility functions (runtime path; on dev use source from repo or set KEYMAN_MANUAL=1 and ensure utils.sh is available)
 source /vault/keyman/utils.sh
 
-# Function to get the admin user
+# Function to get the admin user (homeserver deploy: owner)
 get_admin_user() {
-echo "owner"
+    echo "owner"
 }
 
-# Function to set admin user password
+# Returns 0 only when we are in a context where changing admin password and writing /deploy is intended.
+# Skip when: KEYMAN_MANUAL=1, or interactive run on a system without /deploy (not a homeserver deploy).
+should_set_admin_password() {
+    [ "$KEYMAN_MANUAL" = "1" ] && return 1
+    [ "$AUTOMATED_SETUP" = "1" ] && return 0
+    [ -d /deploy ] && return 0
+    return 1
+}
+
+# Function to set admin user password and write /deploy/password.txt. Only call when should_set_admin_password.
 set_admin_password() {
     local password="$1"
     local admin_user=$(get_admin_user)
     echo "${admin_user}:$password" | chpasswd || error_exit "Failed to set admin user password"
-    
-    # Write password to ~/password.txt for reference
+    mkdir -p /deploy || error_exit "Failed to create /deploy"
     echo "$password" > "/deploy/password.txt"
-    chmod 777 "/deploy/password.txt"
+    chmod 700 "/deploy/password.txt"
     chown "${admin_user}:${admin_user}" "/deploy/password.txt"
     echo "Admin password written to /deploy/password.txt"
 }
 
 setup_key_system() {
-    # Get admin user for ownership
     local admin_user=$(get_admin_user)
-    
+
+    if [ "$KEYMAN_MANUAL" = "1" ]; then
+        echo "--- KEYMAN MANUAL MODE ---"
+        echo "This run will only create skeleton.key and attempt service_suite/NAS keys."
+        echo "It will NOT change any system user password or write to /deploy."
+        echo "On a real homeserver deploy, the full flow sets the admin (owner) password"
+        echo "to the generated key and writes /deploy/password.txt."
+        echo "---"
+    fi
+
     # Create necessary directories with proper permissions and ownership
     mkdir -p "$KEY_DIR" || error_exit "Failed to create key directory"
     chmod 700 "$KEY_DIR"
@@ -51,11 +71,14 @@ setup_key_system() {
             chmod 600 "$SKELETON_KEY"
             chown "${admin_user}:${admin_user}" "$SKELETON_KEY"
 
-            # Set admin user password
-            if [ -n "$DEFAULT_ROOT_PASSWORD" ] && [ "$TEST_FLAG" != "1" ]; then
-                set_admin_password "$DEFAULT_ROOT_PASSWORD"
-            elif [ "$TEST_FLAG" != "1" ]; then
-                set_admin_password "$MASTER_PASSWORD"
+            if should_set_admin_password; then
+                if [ -n "$DEFAULT_ROOT_PASSWORD" ] && [ "$TEST_FLAG" != "1" ]; then
+                    set_admin_password "$DEFAULT_ROOT_PASSWORD"
+                elif [ "$TEST_FLAG" != "1" ]; then
+                    set_admin_password "$MASTER_PASSWORD"
+                fi
+            elif [ "$KEYMAN_MANUAL" = "1" ]; then
+                echo "MANUAL: Skipped setting admin password. Full deploy would set owner password to the key above."
             fi
 
             # Create service suite key (encryption key for all service credentials)
@@ -130,13 +153,21 @@ setup_key_system() {
             echo "It cannot be recovered if lost."
             echo "Write it down and store it in a safe safe place."
 
-            # Set admin user password
-            if [ -n "$DEFAULT_ROOT_PASSWORD" ] && [ "$TEST_FLAG" != "1" ]; then
-                set_admin_password "$DEFAULT_ROOT_PASSWORD"
-            elif [ "$TEST_FLAG" != "1" ]; then
-                set_admin_password "$MASTER_PASSWORD"
+            if should_set_admin_password; then
+                if [ -n "$DEFAULT_ROOT_PASSWORD" ] && [ "$TEST_FLAG" != "1" ]; then
+                    set_admin_password "$DEFAULT_ROOT_PASSWORD"
+                elif [ "$TEST_FLAG" != "1" ]; then
+                    set_admin_password "$MASTER_PASSWORD"
+                fi
+            else
+                if [ "$KEYMAN_MANUAL" = "1" ]; then
+                    echo "MANUAL: Skipped setting admin password. Full deploy would set owner password to the key above."
+                else
+                    echo "WARNING: /deploy not present; skipped setting admin password and /deploy/password.txt."
+                    echo "This is not a homeserver deploy context. To only create keys, use KEYMAN_MANUAL=1."
+                fi
             fi
-            
+
             read -p "Press Enter after you have securely stored the master password..."
             
             # Create new service suite key
@@ -147,10 +178,15 @@ setup_key_system() {
             fi
             
             init_ramdisk
-            SERVICE_SUITE_PASSWORD=$(generate_secure_password)
-            while ! validate_password "$SERVICE_SUITE_PASSWORD"; do
+            # Manual mode: use skeleton as service suite password (same as automated) for consistent recovery.
+            if [ "$KEYMAN_MANUAL" = "1" ]; then
+                SERVICE_SUITE_PASSWORD="$MASTER_PASSWORD"
+            else
                 SERVICE_SUITE_PASSWORD=$(generate_secure_password)
-            done
+                while ! validate_password "$SERVICE_SUITE_PASSWORD"; do
+                    SERVICE_SUITE_PASSWORD=$(generate_secure_password)
+                done
+            fi
             echo "username=\"service_suite\"" > "$TEMP_DIR/service_suite"
             echo "password=\"$SERVICE_SUITE_PASSWORD\"" >> "$TEMP_DIR/service_suite"
             
@@ -159,6 +195,13 @@ setup_key_system() {
                 -out "$SERVICE_SUITE_KEY" -pass pass:"$MASTER_PASSWORD"
             chmod 600 "$SERVICE_SUITE_KEY"
             
+            if [ "$KEYMAN_MANUAL" = "1" ]; then
+                echo "username=\"nas\"" > "$TEMP_DIR/nas"
+                echo "password=\"$SERVICE_SUITE_PASSWORD\"" >> "$TEMP_DIR/nas"
+                openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TEMP_DIR/nas" \
+                    -out "$NAS_KEY" -pass pass:"$MASTER_PASSWORD"
+                chmod 600 "$NAS_KEY"
+            fi
             unset SERVICE_SUITE_PASSWORD
             secure_cleanup
             
