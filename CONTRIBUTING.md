@@ -210,7 +210,7 @@ Include in your PR:
 - No memory leaks detected
 
 ### Test Environment
-- OS: Debian 12 / Arch Linux
+- OS: Debian 13 (Trixie) / Arch Linux
 - OpenSSL version: 3.x
 - Compiler: GCC 13 with -Wall -Wextra -Werror
 
