@@ -127,9 +127,28 @@ sudo /vault/keyman/exportkey.sh myapp_db
 - Passing the password as the third argument is **simple but not secret from the local shell**: it may appear in shell history and was visible in the process list while the command ran. For air-gapped or policy reasons, plan accordingly (the script does not read from stdin for the password).
 - **Admin / symlink keys:** Some flows use a symlink to `service_suite.key` instead of a dedicated `newkey` entry (see `newkey.sh` internal `adminkey` mode in other scripts). For a normal app credential, use `newkey.sh` as above.
 
+## Forward Python installer
+
+The preferred public entry face is now:
+
+```bash
+python3 index.py
+python3 index.py plan --profile vault-only
+python3 index.py plan --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
+sudo KEYMAN_ADMIN_SECRET='<operator-local-secret>' python3 index.py install --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
+```
+
+Profiles:
+
+- `vault-only`: install and initialize Keyman without changing any operating-system account secret.
+- `field-node`: initialize Keyman, set the configured operator account for local TTY access only when an access secret is explicitly supplied, and keep SSH key-only.
+- `full-deploy`: compatibility full-system posture for the original deploy lane.
+
+The Python installer emits redacted JSON receipts and avoids writing deploy secret material unless the caller explicitly selects that behavior.
+
 ## Summary
 
-- **Manual run on dev / unknown system:** Use `KEYMAN_MANUAL=1` so the script only creates a skeleton key and keys, with warnings that the real deal sets owner and /deploy.
-- **Full flow** sets the **owner** (admin) user password and writes `/deploy/password.txt`; it does **not** set the root password. Root is unchanged.
+- **Manual run on dev / unknown system:** Use `KEYMAN_MANUAL=1` so the legacy script only creates a skeleton key and keys, with warnings that the full flow sets owner and /deploy.
+- **Full legacy flow** sets the **owner** admin account secret and writes the deploy secret file; it does **not** set the root account. Root is unchanged.
 
 For other keyman commands (exportkey, deletekey, change_service_suite_key, LUKS/Transmission), see the Keyman component skill (`.cursor/skills/homeserver-components-keyman/SKILL.md`).
