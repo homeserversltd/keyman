@@ -1,0 +1,45 @@
+{
+  "metadata": {
+    "name": "keyman",
+    "description": "Root entry face for installing and operating the Keyman credential vault without inheriting legacy account-secret mutation semantics.",
+    "version": "0.2.0",
+    "schema_version": "1.0"
+  },
+  "execution": {
+    "entry_point": "index.py",
+    "language": "python"
+  },
+  "children": [
+    "lib"
+  ],
+  "paths": {
+    "runtime_dir": "/vault/keyman",
+    "key_dir": "/root/key",
+    "vault_dir": "/vault/.keys",
+    "exchange_dir": "/mnt/keyexchange",
+    "deploy_secret_file": "/deploy/operator-secret.txt",
+    "sshd_dropin": "/etc/ssh/sshd_config.d/99-keyman-operator-access.conf"
+  },
+  "profiles": {
+    "vault-only": {
+      "description": "Install Keyman runtime and initialize vault keys without changing any operating-system account secret.",
+      "set_admin_secret": false,
+      "write_deploy_secret": false,
+      "ssh_password_auth": "keep"
+    },
+    "field-node": {
+      "description": "Install Keyman for a physical field node: the operator account may receive an explicitly supplied local TTY secret, SSH remains key-only, and vault initialization never writes the deploy secret file.",
+      "admin_user": "owner",
+      "set_admin_secret": true,
+      "write_deploy_secret": false,
+      "ssh_password_auth": "disable"
+    },
+    "full-deploy": {
+      "description": "Compatibility full deploy shape: initialize vault, set the operator account secret, and optionally write the deploy secret file when explicitly requested.",
+      "admin_user": "owner",
+      "set_admin_secret": true,
+      "write_deploy_secret": true,
+      "ssh_password_auth": "keep"
+    }
+  }
+}

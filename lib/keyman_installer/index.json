@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "name": "keyman-installer",
+    "description": "Pythonic installer band for Keyman vault runtime, key hierarchy, admin password policy, and SSH password-auth posture.",
+    "version": "0.1.0",
+    "schema_version": "1.0"
+  },
+  "children": [],
+  "execution": {
+    "entry_point": "index.py",
+    "language": "python"
+  }
+}
