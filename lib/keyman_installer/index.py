@@ -60,7 +60,10 @@ class InstallOptions:
     admin_user: str
     admin_secret: str | None
     master_secret: str | None
+    current_service_suite_secret: str | None
+    new_service_suite_secret: str | None
     set_admin_secret: bool
+    rotate_service_suite: bool
     write_deploy_secret: bool
     ssh_interactive_auth: str
     build_crypto: bool
@@ -125,6 +128,15 @@ class KeymanInstaller:
                     detail={"secret": REDACTED, "local_console_intent": True},
                 )
             )
+        if self.options.rotate_service_suite:
+            self.actions.append(
+                Action(
+                    "rotate-service-suite",
+                    str(p.vault_dir),
+                    True,
+                    detail={"current_secret": REDACTED, "new_secret": REDACTED, "rewraps_service_keys": True},
+                )
+            )
         if self.options.write_deploy_secret:
             self.actions.append(Action("write-deploy-secret-file", str(p.deploy_secret_file), True, detail={"secret": REDACTED}))
         if self.options.ssh_interactive_auth != "keep":
@@ -183,6 +195,9 @@ class KeymanInstaller:
             "admin_secret": REDACTED if self.options.admin_secret else "not-supplied",
             "master_secret": REDACTED if self.options.master_secret else "generated-or-existing",
             "set_admin_secret": self.options.set_admin_secret,
+            "rotate_service_suite": self.options.rotate_service_suite,
+            "current_service_suite_secret": REDACTED if self.options.current_service_suite_secret else "not-supplied",
+            "new_service_suite_secret": REDACTED if self.options.new_service_suite_secret else "not-supplied",
             "write_deploy_secret": self.options.write_deploy_secret,
             "ssh_interactive_auth": self.options.ssh_interactive_auth,
             "secret_material": REDACTED,
@@ -285,6 +300,74 @@ class KeymanInstaller:
             raise InstallerError("setting admin secret requires --admin-secret, --admin-secret-env, or --admin-secret-file")
         self._run(["chpasswd"], input_text=f"{self.options.admin_user}:{password}\n")
         action.status = "done"
+
+    def _do_rotate_service_suite(self, action: Action) -> None:
+        current_secret = self.options.current_service_suite_secret
+        new_secret = self.options.new_service_suite_secret
+        if not current_secret or not new_secret:
+            raise InstallerError("rotating service suite requires --current-service-suite-secret-* and --new-service-suite-secret-*")
+        if current_secret == new_secret:
+            raise InstallerError("new service-suite secret must differ from current service-suite secret")
+        self._reject_unquoted_keyman_value(new_secret, "new service-suite secret")
+        observed = self._decrypt_service_suite_secret()
+        if observed != current_secret:
+            raise InstallerError("current service-suite secret did not match installed service_suite.key")
+        services = self._service_key_names()
+        for service_name in services:
+            self._run([str(self.options.paths.runtime_dir / "exportkey.sh"), service_name])
+        for service_name in services:
+            decrypted = self.options.paths.exchange_dir / service_name
+            if not decrypted.exists():
+                raise InstallerError(f"exported service payload missing for {service_name}")
+            reencrypt_input = self.options.paths.exchange_dir / f"reencrypt_{service_name}_{os.getpid()}"
+            reencrypt_input.write_text(f"service={service_name}\nnew_password={new_secret}\n", encoding="utf-8")
+            os.chmod(reencrypt_input, 0o600)
+            try:
+                self._run([str(self.options.paths.runtime_dir / "keyman-crypto"), "reencrypt", str(reencrypt_input)])
+            finally:
+                self._shred_or_unlink(reencrypt_input)
+                self._shred_or_unlink(decrypted)
+        suite_plain = self.options.paths.exchange_dir / "service_suite.rotate"
+        suite_plain.parent.mkdir(parents=True, exist_ok=True)
+        suite_plain.write_text(f'username="service_suite"\npassword="{new_secret}"\n', encoding="utf-8")
+        os.chmod(suite_plain, 0o600)
+        try:
+            self._run([str(self.options.paths.runtime_dir / "keyman-crypto"), "encrypt_suite_key", str(suite_plain)])
+        finally:
+            self._shred_or_unlink(suite_plain)
+        action.status = "done"
+        action.detail["service_key_count"] = len(services)
+
+    def _decrypt_service_suite_secret(self) -> str:
+        suite = self.options.paths.service_suite_key
+        require = [self.options.paths.skeleton_key, suite]
+        for path in require:
+            if not path.exists():
+                raise InstallerError(f"required Keyman secret file is missing: {path}")
+        self.options.paths.exchange_dir.mkdir(parents=True, exist_ok=True)
+        out = self.options.paths.exchange_dir / f"service_suite_verify_{os.getpid()}"
+        try:
+            self._run([
+                "openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
+                "-in", str(suite), "-out", str(out), "-pass", f"file:{self.options.paths.skeleton_key}",
+            ])
+            data = out.read_text(encoding="utf-8")
+            for line in data.splitlines():
+                if line.startswith("password="):
+                    return line.split('"', 2)[1]
+            raise InstallerError("service_suite.key decrypted but contained no password field")
+        finally:
+            self._shred_or_unlink(out)
+
+    def _service_key_names(self) -> list[str]:
+        if not self.options.paths.vault_dir.exists():
+            raise InstallerError(f"vault key directory missing: {self.options.paths.vault_dir}")
+        names = []
+        for path in sorted(self.options.paths.vault_dir.glob("*.key")):
+            if path.name == "service_suite.key":
+                continue
+            names.append(path.stem)
+        return names
 
     def _do_write_deploy_secret_file(self, action: Action) -> None:
         password = self.options.admin_secret
@@ -456,6 +539,18 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
         file_path=ns.master_secret_file,
         label="master secret",
     )
+    current_service_suite_secret = resolve_secret(
+        literal=None,
+        env_name=ns.current_service_suite_secret_env,
+        file_path=ns.current_service_suite_secret_file,
+        label="current service-suite secret",
+    )
+    new_service_suite_secret = resolve_secret(
+        literal=None,
+        env_name=ns.new_service_suite_secret_env,
+        file_path=ns.new_service_suite_secret_file,
+        label="new service-suite secret",
+    )
 
     set_admin_secret = ns.set_admin_secret if ns.set_admin_secret is not None else bool(profile.get("set_admin_secret", False))
     write_deploy_secret = ns.write_deploy_secret if ns.write_deploy_secret is not None else bool(profile.get("write_deploy_secret", False))
@@ -469,7 +564,10 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
         admin_user=admin_user,
         admin_secret=admin_secret,
         master_secret=master_secret,
+        current_service_suite_secret=current_service_suite_secret,
+        new_service_suite_secret=new_service_suite_secret,
         set_admin_secret=set_admin_secret,
+        rotate_service_suite=ns.rotate_service_suite,
         write_deploy_secret=write_deploy_secret,
         ssh_interactive_auth=ssh_interactive_auth,
         build_crypto=not ns.no_build_crypto,
@@ -508,6 +606,11 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--master-secret", help="Explicit Keyman master/skeleton secret. Usually omit to generate.")
     parser.add_argument("--master-secret-env")
     parser.add_argument("--master-secret-file")
+    parser.add_argument("--current-service-suite-secret-env", help="Environment variable containing the current service-suite secret for rotate")
+    parser.add_argument("--current-service-suite-secret-file", help="File containing the current service-suite secret for rotate")
+    parser.add_argument("--new-service-suite-secret-env", help="Environment variable containing the new service-suite secret for rotate")
+    parser.add_argument("--new-service-suite-secret-file", help="File containing the new service-suite secret for rotate")
+    parser.add_argument("--rotate-service-suite", action="store_true", help="Rotate service_suite.key and rewrap existing service keys")
     parser.add_argument("--set-admin-secret", dest="set_admin_secret", action="store_true", default=None)
     parser.add_argument("--no-set-admin-secret", dest="set_admin_secret", action="store_false")
     parser.add_argument("--write-deploy-secret", dest="write_deploy_secret", action="store_true", default=None)
@@ -532,6 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_flags(plan)
     install = sub.add_parser("install", help="Apply the selected Keyman install profile")
     add_common_flags(install)
+    rotate = sub.add_parser("rotate", help="Locally rotate owner password and/or service-suite key with redacted receipts")
+    add_common_flags(rotate)
+    rotate.set_defaults(rotate_service_suite=True)
     verify = sub.add_parser("verify", help="Verify installed Keyman runtime/vault shape")
     add_common_flags(verify)
     return parser
@@ -544,6 +650,7 @@ Examples:
   python3 index.py plan --profile vault-only
   python3 index.py plan --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
   sudo KEYMAN_ADMIN_SECRET=<operator-local-secret> python3 index.py install --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
+  python3 index.py rotate --dry-run --profile field-node --admin-secret-env NEW_OWNER_SECRET --current-service-suite-secret-env CURRENT_KEYMAN_SECRET --new-service-suite-secret-env NEW_KEYMAN_SECRET
 
 Profile intent:
   vault-only             initialize Keyman without changing OS account secrets

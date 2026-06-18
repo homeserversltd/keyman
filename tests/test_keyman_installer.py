@@ -72,6 +72,39 @@ class KeymanInstallerCliTests(unittest.TestCase):
             for term in FORBIDDEN_PUBLIC_TERMS:
                 self.assertNotIn(term, text, f"{term!r} leaked in {path}")
 
+    def test_rotate_plan_is_local_and_redacted(self) -> None:
+        result = self.run_index(
+            "rotate",
+            "--dry-run",
+            "--profile",
+            "field-node",
+            "--admin-secret-env",
+            "NEW_OWNER_SECRET",
+            "--current-service-suite-secret-env",
+            "CURRENT_KEYMAN_SECRET",
+            "--new-service-suite-secret-env",
+            "NEW_KEYMAN_SECRET",
+            env={
+                "NEW_OWNER_SECRET": "sample-new-owner-secret",
+                "CURRENT_KEYMAN_SECRET": "sample-current-suite-secret",
+                "NEW_KEYMAN_SECRET": "sample-new-suite-secret",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("sample-new-owner-secret", result.stdout)
+        self.assertNotIn("sample-current-suite-secret", result.stdout)
+        self.assertNotIn("sample-new-suite-secret", result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["profile"], "field-node")
+        self.assertTrue(payload["set_admin_secret"])
+        self.assertTrue(payload["rotate_service_suite"])
+        actions = [action["name"] for action in payload["actions"]]
+        self.assertIn("set-admin-secret", actions)
+        self.assertIn("rotate-service-suite", actions)
+        self.assertEqual(payload["secret_material"], "[REDACTED]")
+
 
 if __name__ == "__main__":
     unittest.main()

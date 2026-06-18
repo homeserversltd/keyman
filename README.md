@@ -136,6 +136,7 @@ python3 index.py
 python3 index.py plan --profile vault-only
 python3 index.py plan --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
 sudo KEYMAN_ADMIN_SECRET='<operator-local-secret>' python3 index.py install --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
+python3 index.py rotate --dry-run --profile field-node --admin-secret-env NEW_OWNER_SECRET --current-service-suite-secret-env CURRENT_KEYMAN_SECRET --new-service-suite-secret-env NEW_KEYMAN_SECRET
 ```
 
 Profiles:
@@ -144,7 +145,7 @@ Profiles:
 - `field-node`: initialize Keyman, set the configured operator account for local TTY access only when an access secret is explicitly supplied, and keep SSH key-only.
 - `full-deploy`: compatibility full-system posture for the original deploy lane.
 
-The Python installer emits redacted JSON receipts and avoids writing deploy secret material unless the caller explicitly selects that behavior.
+The Python installer emits redacted JSON receipts and avoids writing deploy secret material unless the caller explicitly selects that behavior. `rotate` is local-only: it can update the local operator account password and rewrap the local service-suite/service keys from explicitly named env/file secret sources; it does not contact any private orchestration system.
 
 ## Summary
 
