@@ -115,6 +115,7 @@ class KeymanInstallerCliTests(unittest.TestCase):
             for name in ["keyman-crypto", "utils.sh", "newkey.sh", "exportkey.sh"]:
                 (runtime / name).write_text("fixture\n", encoding="utf-8")
             shutil.copy2(ROOT / "lib" / "keyman_caduceus_access.py", runtime / "lib" / "keyman_caduceus_access.py")
+            shutil.copy2(ROOT / "lib" / "keyman_caduceus_access.runtime.json", runtime / "lib" / "keyman_caduceus_access.runtime.json")
             key_dir = root / "key"
             vault = root / "vault"
             key_dir.mkdir()
@@ -128,6 +129,8 @@ class KeymanInstallerCliTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["checks"]["caduceus_access_module"])
+        self.assertTrue(payload["checks"]["caduceus_access_artifact"])
+        self.assertTrue(payload["checks"]["caduceus_access_source_binding"])
         self.assertTrue(payload["checks"]["caduceus_access_importable"])
         self.assertTrue(payload["caduceus_access"]["importable_with_crypto_dependency"])
         self.assertEqual(payload["caduceus_access"]["operation"], "root-in-process-caduceus-verify-and-derive")
