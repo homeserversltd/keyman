@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -113,7 +114,7 @@ class KeymanInstallerCliTests(unittest.TestCase):
             (runtime / "lib").mkdir(parents=True)
             for name in ["keyman-crypto", "utils.sh", "newkey.sh", "exportkey.sh"]:
                 (runtime / name).write_text("fixture\n", encoding="utf-8")
-            (runtime / "lib" / "keyman_caduceus_access.py").write_text("fixture\n", encoding="utf-8")
+            shutil.copy2(ROOT / "lib" / "keyman_caduceus_access.py", runtime / "lib" / "keyman_caduceus_access.py")
             key_dir = root / "key"
             vault = root / "vault"
             key_dir.mkdir()
@@ -127,6 +128,8 @@ class KeymanInstallerCliTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["checks"]["caduceus_access_module"])
+        self.assertTrue(payload["checks"]["caduceus_access_importable"])
+        self.assertTrue(payload["caduceus_access"]["importable_with_crypto_dependency"])
         self.assertEqual(payload["caduceus_access"]["operation"], "root-in-process-caduceus-verify-and-derive")
         self.assertEqual(payload["caduceus_access"]["private_material"], "[REDACTED]")
 

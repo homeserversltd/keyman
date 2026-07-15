@@ -1,5 +1,7 @@
 import hashlib
 import os
+import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -18,9 +20,11 @@ import keyman_caduceus_access as access
 
 FIXTURE_SKELETON = bytes.fromhex("63616475636575732d666978747572652d736b656c65746f6e2d7631006279746573")
 FIXTURE_PIN = "2468"
+FIXTURE_NEW_PIN = "9753"
 FIXTURE_IDENTITY = "911ec7c51dbfff3d9e8d45c80895fd9eb01a1c0a211046eb066564a77a914811"
 FIXTURE_SEED = "6f307d5a08788689e0c34b8e8315049b56533299f4e988f22132b721edcf7f43"
 FIXTURE_PUBLIC = "2d3339908e1f76eb0cc89058b5252a2243e7d831378dbc78cb5e646ad49bf9a6"
+FIXTURE_SUITE_PASSWORD = b"service-suite-fixture-password"
 
 
 def encrypt_fixture(plaintext: bytes, password: bytes, salt: bytes) -> bytes:
@@ -38,21 +42,36 @@ class CaduceusAccessTests(unittest.TestCase):
         self.vault_dir = root / "vault"
         self.key_dir.mkdir()
         self.vault_dir.mkdir()
-        (self.key_dir / "skeleton.key").write_bytes(FIXTURE_SKELETON)
-        suite = b'service-suite-fixture-password'
-        (self.vault_dir / "service_suite.key").write_bytes(
-            encrypt_fixture(b'username="service_suite"\npassword="service-suite-fixture-password"\n', FIXTURE_SKELETON, b"suite123")
-        )
-        (self.vault_dir / "caduceus.key").write_bytes(
-            encrypt_fixture(f'username="{FIXTURE_IDENTITY}"\npassword="{FIXTURE_PIN}"\n'.encode(), suite, b"caduceus")
-        )
+        self.write_skeleton(FIXTURE_SKELETON)
+        self.write_suite()
+        self.write_credential(FIXTURE_PIN)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def derive(self, pin: str) -> access.DerivedCaduceusSigner:
+    def write_skeleton(self, raw: bytes) -> None:
+        (self.key_dir / "skeleton.key").write_bytes(raw)
+
+    def write_suite(self, username: str = "service_suite") -> None:
+        (self.vault_dir / "service_suite.key").write_bytes(encrypt_fixture(
+            f'username="{username}"\npassword="{FIXTURE_SUITE_PASSWORD.decode()}"\n'.encode(),
+            FIXTURE_SKELETON.split(b"\x00", 1)[0],
+            b"suite123",
+        ))
+
+    def write_credential(self, pin: str, identity: str = FIXTURE_IDENTITY) -> None:
+        (self.vault_dir / "caduceus.key").write_bytes(encrypt_fixture(
+            f'username="{identity}"\npassword="{pin}"\n'.encode(),
+            FIXTURE_SUITE_PASSWORD,
+            b"caduceus",
+        ))
+
+    def root_call(self, function, *args):
         with mock.patch.object(access, "_require_root"):
-            return access.verify_and_derive_caduceus(pin, key_dir=self.key_dir, vault_dir=self.vault_dir)
+            return function(*args, key_dir=self.key_dir, vault_dir=self.vault_dir)
+
+    def derive(self, pin: str) -> access.DerivedCaduceusSigner:
+        return self.root_call(access.verify_and_derive_caduceus, pin)
 
     def test_fixture_vector_verifies_and_derives_exact_ed25519_signer(self) -> None:
         self.assertEqual(hashlib.sha256(FIXTURE_SKELETON).hexdigest(), FIXTURE_IDENTITY)
@@ -63,6 +82,22 @@ class CaduceusAccessTests(unittest.TestCase):
             self.assertEqual(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(), FIXTURE_PUBLIC)
         self.assertEqual(signer._seed, bytearray())
 
+    def test_newline_terminated_skeleton_uses_exact_legacy_passphrase_and_identity(self) -> None:
+        self.write_skeleton(FIXTURE_SKELETON + b"\n")
+        with self.derive(FIXTURE_PIN) as signer:
+            self.assertEqual(signer.identity_sha256, FIXTURE_IDENTITY)
+        identity_bytes = access._canonical_skeleton_identity_bytes(bytearray(b"  keep-space  \n"))
+        self.assertEqual(identity_bytes, bytearray(b"  keep-space  "))
+        self.assertEqual(access._legacy_skeleton_passphrase(identity_bytes), bytearray(b"  keep-space  "))
+        self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"keep-cr\r\n")), bytearray(b"keep-cr\r"))
+        self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"secret\ntrailing")), bytearray(b"secret"))
+        self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"secret\r\ntrailing")), bytearray(b"secret\r"))
+        self.assertEqual(
+            access._canonical_skeleton_identity_bytes(bytearray(b"x" * 512)),
+            bytearray(b"x" * 511),
+        )
+        self.assertEqual(access._legacy_skeleton_passphrase(bytearray(b"prefix\x00identity-tail")), bytearray(b"prefix"))
+
     def test_wrong_pin_refuses_without_public_or_private_output(self) -> None:
         with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
             self.derive("wrong")
@@ -72,31 +107,78 @@ class CaduceusAccessTests(unittest.TestCase):
             with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-staff-root-required"):
                 access.verify_and_derive_caduceus(FIXTURE_PIN, key_dir=self.key_dir, vault_dir=self.vault_dir)
 
-    def test_missing_corrupt_and_identity_mismatch_refuse(self) -> None:
+    def test_missing_corrupt_identity_and_service_suite_username_refuse(self) -> None:
         (self.vault_dir / "caduceus.key").unlink()
         with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-key-unavailable"):
             self.derive(FIXTURE_PIN)
         (self.vault_dir / "caduceus.key").write_bytes(b"not-a-key")
         with self.assertRaises(access.CaduceusAccessRefused):
             self.derive(FIXTURE_PIN)
+        self.write_credential(FIXTURE_PIN, identity="not-the-canonical-identity")
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-identity-mismatch"):
+            self.derive(FIXTURE_PIN)
+        self.write_suite(username="wrong-suite")
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-service-suite-identity-mismatch"):
+            self.derive(FIXTURE_PIN)
 
-    def test_status_reads_no_secret_and_reports_only_shape(self) -> None:
+    def test_provision_refuses_overwrite_and_creates_mode_0600(self) -> None:
+        before = (self.vault_dir / "caduceus.key").read_bytes()
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-key-exists"):
+            self.root_call(access.provision_caduceus, FIXTURE_NEW_PIN)
+        self.assertEqual((self.vault_dir / "caduceus.key").read_bytes(), before)
+        (self.vault_dir / "caduceus.key").unlink()
+        status = self.root_call(access.provision_caduceus, FIXTURE_NEW_PIN)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["private_material"], "[REDACTED]")
+        self.assertEqual(stat.S_IMODE((self.vault_dir / "caduceus.key").stat().st_mode), 0o600)
+        with self.derive(FIXTURE_NEW_PIN):
+            pass
+
+    def test_pin_change_is_atomic_and_old_refusal_leaves_ciphertext_unchanged(self) -> None:
+        target = self.vault_dir / "caduceus.key"
+        before = target.read_bytes()
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
+            self.root_call(access.change_caduceus_pin, "wrong-old", FIXTURE_NEW_PIN)
+        self.assertEqual(target.read_bytes(), before)
+        status = self.root_call(access.change_caduceus_pin, FIXTURE_PIN, FIXTURE_NEW_PIN)
+        self.assertTrue(status["ok"])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertNotEqual(target.read_bytes(), before)
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
+            self.derive(FIXTURE_PIN)
+        with self.derive(FIXTURE_NEW_PIN):
+            pass
+
+    def test_provision_and_change_leave_no_plaintext_artifacts(self) -> None:
+        (self.vault_dir / "caduceus.key").unlink()
+        self.root_call(access.provision_caduceus, FIXTURE_PIN)
+        self.root_call(access.change_caduceus_pin, FIXTURE_PIN, FIXTURE_NEW_PIN)
+        paths = list(self.vault_dir.iterdir())
+        self.assertEqual({path.name for path in paths}, {"service_suite.key", "caduceus.key"})
+        self.assertNotIn(FIXTURE_PIN.encode(), (self.vault_dir / "caduceus.key").read_bytes())
+        self.assertNotIn(FIXTURE_NEW_PIN.encode(), (self.vault_dir / "caduceus.key").read_bytes())
+
+    def test_status_reads_no_secret_and_requires_importable_module(self) -> None:
         runtime = Path(self.temp.name) / "runtime"
         (runtime / "lib").mkdir(parents=True)
-        (runtime / "lib" / "keyman_caduceus_access.py").write_text("# installed\n", encoding="utf-8")
+        target = runtime / "lib" / "keyman_caduceus_access.py"
+        shutil.copy2(ROOT / "lib" / "keyman_caduceus_access.py", target)
         receipt = access.caduceus_access_status(runtime_dir=runtime)
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["private_material"], "[REDACTED]")
         self.assertNotIn("seed", receipt)
         self.assertNotIn("pin", receipt)
+        target.write_text("this is not valid Python (", encoding="utf-8")
+        self.assertFalse(access.caduceus_access_status(runtime_dir=runtime)["ok"])
 
-    def test_new_access_implementation_has_no_legacy_or_secret_leak_paths(self) -> None:
+    def test_new_access_implementation_has_no_legacy_or_plaintext_leak_paths(self) -> None:
         source = (ROOT / "lib" / "keyman_caduceus_access.py").read_text(encoding="utf-8")
-        forbidden = ["export" + "key", "/mnt/" + "keyexchange", "temp" + "file", "print(", "logging.", "subprocess"]
+        forbidden = ["export" + "key", "/mnt/" + "keyexchange", "print(", "logging.", "subprocess"]
         for term in forbidden:
             self.assertNotIn(term, source)
         self.assertIn("compare_digest", source)
         self.assertIn("_wipe", source)
+        self.assertIn("best-effort", source)
 
 
 if __name__ == "__main__":

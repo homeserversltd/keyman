@@ -11,6 +11,7 @@ deploy are separate profiles instead of implicit branches hidden inside
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import secrets
@@ -162,6 +163,7 @@ class KeymanInstaller:
     def verify(self) -> dict[str, Any]:
         p = self.options.paths
         access_module = p.runtime_dir / "lib" / "keyman_caduceus_access.py"
+        access_importable = self._access_module_importable(access_module)
         checks = {
             "runtime_dir": p.runtime_dir.is_dir(),
             "keyman_crypto": (p.runtime_dir / "keyman-crypto").exists(),
@@ -169,6 +171,7 @@ class KeymanInstaller:
             "newkey_sh": (p.runtime_dir / "newkey.sh").exists(),
             "exportkey_sh": (p.runtime_dir / "exportkey.sh").exists(),
             "caduceus_access_module": access_module.is_file(),
+            "caduceus_access_importable": access_importable,
             "key_dir": p.key_dir.is_dir(),
             "vault_dir": p.vault_dir.is_dir(),
             "skeleton_key": p.skeleton_key.exists(),
@@ -182,6 +185,7 @@ class KeymanInstaller:
             "checks": checks,
             "caduceus_access": {
                 "installed": checks["caduceus_access_module"],
+                "importable_with_crypto_dependency": checks["caduceus_access_importable"],
                 "operation": "root-in-process-caduceus-verify-and-derive",
                 "service": "caduceus",
                 "private_material": REDACTED,
@@ -189,6 +193,23 @@ class KeymanInstaller:
             "secret_material": REDACTED,
             "first_missing_signal": "none" if ok else "keyman-install-incomplete",
         }
+
+    @staticmethod
+    def _access_module_importable(path: Path) -> bool:
+        """Check installed code and its crypto import without opening Keyman data."""
+        name = "_keyman_caduceus_access_install_check"
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                return False
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return True
+        except (ImportError, OSError, SyntaxError, ValueError):
+            return False
+        finally:
+            sys.modules.pop(name, None)
 
     def receipt(self, *, ok: bool, first_missing_signal: str) -> dict[str, Any]:
         return {
