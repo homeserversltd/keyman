@@ -149,6 +149,26 @@ class CaduceusAccessTests(unittest.TestCase):
         with self.derive(FIXTURE_NEW_PIN):
             pass
 
+    def test_replace_then_directory_fsync_failure_is_commit_uncertain(self) -> None:
+        target = self.vault_dir / "caduceus.key"
+        before = target.read_bytes()
+        calls = 0
+        real_fsync = access.os.fsync
+
+        def fail_second_fsync(fd: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("fixture directory fsync failed")
+            real_fsync(fd)
+
+        with mock.patch.object(access.os, "fsync", side_effect=fail_second_fsync):
+            with self.assertRaisesRegex(access.CaduceusAccessCommitUncertain, "caduceus-key-commit-uncertain"):
+                self.root_call(access.change_caduceus_pin, FIXTURE_PIN, FIXTURE_NEW_PIN)
+        self.assertNotEqual(target.read_bytes(), before)
+        with self.derive(FIXTURE_NEW_PIN):
+            pass
+
     def test_provision_and_change_leave_no_plaintext_artifacts(self) -> None:
         (self.vault_dir / "caduceus.key").unlink()
         self.root_call(access.provision_caduceus, FIXTURE_PIN)

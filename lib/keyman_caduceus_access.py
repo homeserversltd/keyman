@@ -43,6 +43,10 @@ class CaduceusAccessRefused(RuntimeError):
     """A redacted refusal for missing, malformed, or mismatched Keyman data."""
 
 
+class CaduceusAccessCommitUncertain(CaduceusAccessRefused):
+    """Replacement occurred, but Keyman cannot prove the directory commit durable."""
+
+
 def _wipe(value: bytearray) -> None:
     for index in range(len(value)):
         value[index] = 0
@@ -181,6 +185,7 @@ def _atomic_ciphertext_write(target: Path, ciphertext: bytearray, *, replace: bo
     except OSError as exc:
         raise CaduceusAccessRefused("caduceus-key-write-refused") from exc
     temporary_path = Path(temporary)
+    committed = False
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=True) as handle:
@@ -189,6 +194,7 @@ def _atomic_ciphertext_write(target: Path, ciphertext: bytearray, *, replace: bo
             os.fsync(handle.fileno())
         if replace:
             os.replace(temporary_path, target)
+            committed = True
         else:
             try:
                 os.link(temporary_path, target)
@@ -201,6 +207,8 @@ def _atomic_ciphertext_write(target: Path, ciphertext: bytearray, *, replace: bo
         finally:
             os.close(directory_fd)
     except OSError as exc:
+        if committed:
+            raise CaduceusAccessCommitUncertain("caduceus-key-commit-uncertain") from exc
         raise CaduceusAccessRefused("caduceus-key-write-refused") from exc
     finally:
         if temporary_path.exists():
