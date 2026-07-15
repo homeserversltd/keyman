@@ -90,6 +90,12 @@ class CaduceusAccessTests(unittest.TestCase):
         self.assertEqual(identity_bytes, bytearray(b"  keep-space  "))
         self.assertEqual(access._legacy_skeleton_passphrase(identity_bytes), bytearray(b"  keep-space  "))
         self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"keep-cr\r\n")), bytearray(b"keep-cr\r"))
+        self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"secret\ntrailing")), bytearray(b"secret"))
+        self.assertEqual(access._canonical_skeleton_identity_bytes(bytearray(b"secret\r\ntrailing")), bytearray(b"secret\r"))
+        self.assertEqual(
+            access._canonical_skeleton_identity_bytes(bytearray(b"x" * 512)),
+            bytearray(b"x" * 511),
+        )
         self.assertEqual(access._legacy_skeleton_passphrase(bytearray(b"prefix\x00identity-tail")), bytearray(b"prefix"))
 
     def test_wrong_pin_refuses_without_public_or_private_output(self) -> None:

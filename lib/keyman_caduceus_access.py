@@ -1,9 +1,11 @@
 """Root-only in-memory Keyman access for the Caduceus staff process.
 
-The legacy Keyman C reader takes the first skeleton line and removes one final
-``LF`` before PBKDF2.  This module makes that interpretation explicit: it is
-both the service-suite passphrase and the canonical byte sequence hashed for
-the Caduceus identity username.  It never uses broad whitespace stripping.
+Canonical Caduceus identity bytes are the Keyman skeleton secret selected with
+legacy ``fgets(buffer, 512, ...)`` semantics: bytes through the first ``LF`` in
+that 511-byte read window, with that one ``LF`` removed.  They are not broad
+raw-file hashing.  The legacy service-suite PBKDF2 passphrase is separately the
+canonical secret's C-string prefix.  Neither interpretation uses broad
+whitespace stripping.
 
 Python can overwrite mutable bytearrays best-effort.  It cannot honestly erase
 immutable ``str``/``bytes`` values or cryptography key objects; this membrane
@@ -54,10 +56,15 @@ def _read(path: Path) -> bytearray:
 
 
 def _canonical_skeleton_identity_bytes(raw: bytearray) -> bytearray:
-    """Canonical identity bytes: first legacy reader line with only its LF removed."""
-    identity_line = bytearray(raw[:511])
-    if identity_line.endswith(b"\n"):
-        identity_line.pop()
+    """Return canonical secret bytes, not serialized-file bytes or a file hash.
+
+    This exactly selects the first legacy ``fgets(buffer, 512, ...)`` result:
+    stop through the first LF within the 511-byte data window, then remove that
+    LF only.  CR and every other selected byte remain intact.
+    """
+    read_window = raw[:511]
+    newline = read_window.find(b"\n")
+    identity_line = bytearray(read_window if newline < 0 else read_window[:newline])
     if not identity_line:
         raise CaduceusAccessRefused("caduceus-skeleton-malformed")
     return identity_line
