@@ -161,12 +161,14 @@ class KeymanInstaller:
 
     def verify(self) -> dict[str, Any]:
         p = self.options.paths
+        access_module = p.runtime_dir / "lib" / "keyman_caduceus_access.py"
         checks = {
             "runtime_dir": p.runtime_dir.is_dir(),
             "keyman_crypto": (p.runtime_dir / "keyman-crypto").exists(),
             "utils_sh": (p.runtime_dir / "utils.sh").exists(),
             "newkey_sh": (p.runtime_dir / "newkey.sh").exists(),
             "exportkey_sh": (p.runtime_dir / "exportkey.sh").exists(),
+            "caduceus_access_module": access_module.is_file(),
             "key_dir": p.key_dir.is_dir(),
             "vault_dir": p.vault_dir.is_dir(),
             "skeleton_key": p.skeleton_key.exists(),
@@ -178,6 +180,12 @@ class KeymanInstaller:
             "ok": ok,
             "profile": self.options.profile,
             "checks": checks,
+            "caduceus_access": {
+                "installed": checks["caduceus_access_module"],
+                "operation": "root-in-process-caduceus-verify-and-derive",
+                "service": "caduceus",
+                "private_material": REDACTED,
+            },
             "secret_material": REDACTED,
             "first_missing_signal": "none" if ok else "keyman-install-incomplete",
         }
