@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -104,6 +106,32 @@ class KeymanInstallerCliTests(unittest.TestCase):
         self.assertIn("set-admin-secret", actions)
         self.assertIn("rotate-service-suite", actions)
         self.assertEqual(payload["secret_material"], "[REDACTED]")
+
+    def test_verify_receipt_names_redacted_caduceus_access_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            (runtime / "lib").mkdir(parents=True)
+            for name in ["keyman-crypto", "utils.sh", "newkey.sh", "exportkey.sh"]:
+                (runtime / name).write_text("fixture\n", encoding="utf-8")
+            shutil.copy2(ROOT / "lib" / "keyman_caduceus_access.py", runtime / "lib" / "keyman_caduceus_access.py")
+            key_dir = root / "key"
+            vault = root / "vault"
+            key_dir.mkdir()
+            vault.mkdir()
+            (key_dir / "skeleton.key").write_text("fixture\n", encoding="utf-8")
+            (vault / "service_suite.key").write_bytes(b"fixture")
+            result = self.run_index(
+                "verify", "--runtime-dir", str(runtime), "--key-dir", str(key_dir), "--vault-dir", str(vault)
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["checks"]["caduceus_access_module"])
+        self.assertTrue(payload["checks"]["caduceus_access_importable"])
+        self.assertTrue(payload["caduceus_access"]["importable_with_crypto_dependency"])
+        self.assertEqual(payload["caduceus_access"]["operation"], "root-in-process-caduceus-verify-and-derive")
+        self.assertEqual(payload["caduceus_access"]["private_material"], "[REDACTED]")
 
 
 if __name__ == "__main__":
