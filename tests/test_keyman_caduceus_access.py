@@ -73,6 +73,9 @@ class CaduceusAccessTests(unittest.TestCase):
     def derive(self, pin: str) -> access.DerivedCaduceusSigner:
         return self.root_call(access.verify_and_derive_caduceus, pin)
 
+    def bind(self) -> access.DerivedCaduceusSigner:
+        return self.root_call(access.bind_derived_caduceus)
+
     def test_fixture_vector_verifies_and_derives_exact_ed25519_signer(self) -> None:
         self.assertEqual(hashlib.sha256(FIXTURE_SKELETON).hexdigest(), FIXTURE_IDENTITY)
         with self.derive(FIXTURE_PIN) as signer:
@@ -81,6 +84,35 @@ class CaduceusAccessTests(unittest.TestCase):
             self.assertEqual(private.private_bytes_raw().hex(), FIXTURE_SEED)
             self.assertEqual(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(), FIXTURE_PUBLIC)
         self.assertEqual(signer._seed, bytearray())
+
+    def test_bind_derived_uses_current_credential_and_projects_only_public_material(self) -> None:
+        expected_epoch = hashlib.sha256(bytes.fromhex(FIXTURE_PUBLIC)).hexdigest()
+        with self.derive(FIXTURE_PIN) as presented, self.bind() as bound:
+            self.assertEqual(bound.identity_sha256, FIXTURE_IDENTITY)
+            self.assertEqual(bound.private_key().private_bytes_raw().hex(), FIXTURE_SEED)
+            self.assertEqual(bound.public_key_hex, FIXTURE_PUBLIC)
+            self.assertEqual(bound.signer_epoch, expected_epoch)
+            self.assertEqual(bound.epoch, expected_epoch)
+            self.assertEqual(bound.public_key_hex, presented.public_key_hex)
+            self.assertEqual(bound.signer_epoch, presented.signer_epoch)
+        self.assertEqual(bound._seed, bytearray())
+        self.assertEqual(bound.public_key_hex, FIXTURE_PUBLIC)
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-derived-signer-closed"):
+            bound.private_key()
+
+    def test_bind_derived_refuses_non_root_before_key_access(self) -> None:
+        with mock.patch.object(access.os, "geteuid", return_value=1000), mock.patch.object(access, "_read") as read:
+            with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-staff-root-required"):
+                access.bind_derived_caduceus(key_dir=self.key_dir, vault_dir=self.vault_dir)
+        read.assert_not_called()
+
+    def test_bind_derived_refuses_missing_or_corrupt_credential_without_signer(self) -> None:
+        (self.vault_dir / "caduceus.key").unlink()
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-key-unavailable"):
+            self.bind()
+        (self.vault_dir / "caduceus.key").write_bytes(b"not-a-key")
+        with self.assertRaises(access.CaduceusAccessRefused):
+            self.bind()
 
     def test_newline_terminated_skeleton_uses_exact_legacy_passphrase_and_identity(self) -> None:
         self.write_skeleton(FIXTURE_SKELETON + b"\n")
@@ -134,20 +166,34 @@ class CaduceusAccessTests(unittest.TestCase):
         with self.derive(FIXTURE_NEW_PIN):
             pass
 
-    def test_pin_change_is_atomic_and_old_refusal_leaves_ciphertext_unchanged(self) -> None:
+    def test_pin_change_is_atomic_and_rotates_bound_public_epoch(self) -> None:
         target = self.vault_dir / "caduceus.key"
         before = target.read_bytes()
+        with self.bind() as before_bind:
+            before_identity = before_bind.identity_sha256
+            before_public = before_bind.public_key_hex
+            before_epoch = before_bind.signer_epoch
         with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
             self.root_call(access.change_caduceus_pin, "wrong-old", FIXTURE_NEW_PIN)
         self.assertEqual(target.read_bytes(), before)
+        with self.bind() as unchanged_bind:
+            self.assertEqual(unchanged_bind.identity_sha256, before_identity)
+            self.assertEqual(unchanged_bind.public_key_hex, before_public)
+            self.assertEqual(unchanged_bind.signer_epoch, before_epoch)
         status = self.root_call(access.change_caduceus_pin, FIXTURE_PIN, FIXTURE_NEW_PIN)
         self.assertTrue(status["ok"])
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
         self.assertNotEqual(target.read_bytes(), before)
         with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
             self.derive(FIXTURE_PIN)
-        with self.derive(FIXTURE_NEW_PIN):
-            pass
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
+            self.root_call(access.verify_and_derive_caduceus, FIXTURE_PIN)
+        with self.derive(FIXTURE_NEW_PIN) as presented, self.bind() as rebound:
+            self.assertEqual(rebound.identity_sha256, before_identity)
+            self.assertNotEqual(rebound.public_key_hex, before_public)
+            self.assertNotEqual(rebound.signer_epoch, before_epoch)
+            self.assertEqual(rebound.public_key_hex, presented.public_key_hex)
+            self.assertEqual(rebound.signer_epoch, presented.signer_epoch)
 
     def test_replace_then_directory_fsync_failure_is_commit_uncertain(self) -> None:
         target = self.vault_dir / "caduceus.key"
