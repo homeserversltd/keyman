@@ -11,6 +11,7 @@ deploy are separate profiles instead of implicit branches hidden inside
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -163,7 +164,9 @@ class KeymanInstaller:
     def verify(self) -> dict[str, Any]:
         p = self.options.paths
         access_module = p.runtime_dir / "lib" / "keyman_caduceus_access.py"
+        access_artifact = p.runtime_dir / "lib" / "keyman_caduceus_access.runtime.json"
         access_importable = self._access_module_importable(access_module)
+        access_binding = self._access_artifact_matches(access_module, access_artifact)
         checks = {
             "runtime_dir": p.runtime_dir.is_dir(),
             "keyman_crypto": (p.runtime_dir / "keyman-crypto").exists(),
@@ -171,6 +174,8 @@ class KeymanInstaller:
             "newkey_sh": (p.runtime_dir / "newkey.sh").exists(),
             "exportkey_sh": (p.runtime_dir / "exportkey.sh").exists(),
             "caduceus_access_module": access_module.is_file(),
+            "caduceus_access_artifact": access_artifact.is_file(),
+            "caduceus_access_source_binding": access_binding,
             "caduceus_access_importable": access_importable,
             "key_dir": p.key_dir.is_dir(),
             "vault_dir": p.vault_dir.is_dir(),
@@ -185,6 +190,8 @@ class KeymanInstaller:
             "checks": checks,
             "caduceus_access": {
                 "installed": checks["caduceus_access_module"],
+                "runtime_artifact": checks["caduceus_access_artifact"],
+                "source_binding_verified": checks["caduceus_access_source_binding"],
                 "importable_with_crypto_dependency": checks["caduceus_access_importable"],
                 "operation": "root-in-process-caduceus-verify-and-derive",
                 "service": "caduceus",
@@ -193,6 +200,21 @@ class KeymanInstaller:
             "secret_material": REDACTED,
             "first_missing_signal": "none" if ok else "keyman-install-incomplete",
         }
+
+    @staticmethod
+    def _access_artifact_matches(module: Path, artifact: Path) -> bool:
+        """Prove the installed admitted module is exactly the declared source artifact."""
+        try:
+            declaration = json.loads(artifact.read_text(encoding="utf-8"))
+            return declaration == {
+                "schema": "keyman.caduceus_access.runtime.v1",
+                "module": "keyman_caduceus_access.py",
+                "sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+                "install_path": "/opt/keyman/runtime/lib/keyman_caduceus_access.py",
+                "consumer": "caduceus-access.service",
+            }
+        except (OSError, ValueError, TypeError):
+            return False
 
     @staticmethod
     def _access_module_importable(path: Path) -> bool:
