@@ -1,7 +1,7 @@
 {
   "schema": "keyman.caduceus_access.runtime.v1",
   "module": "keyman_caduceus_access.py",
-  "sha256": "27ec5da051d7c5df8a30d04b17d82742404b119074161666853f7d2ea900867d",
+  "sha256": "abf2d08eca90b2113087050d08ebeff1c2c66e7246f7d497540819927f3fcb92",
   "install_path": "/opt/keyman/runtime/lib/keyman_caduceus_access.py",
   "consumer": "caduceus-access.service"
 }

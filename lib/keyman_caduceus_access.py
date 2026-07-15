@@ -20,7 +20,7 @@ import importlib.util
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 _SERVICE_NAME: Final = "caduceus"
 _SERVICE_SUITE_USERNAME: Final = "service_suite"
@@ -221,10 +222,31 @@ def _credential_plaintext(identity: str, pin: bytearray) -> bytearray:
 
 @dataclass
 class DerivedCaduceusSigner:
-    """Private in-memory signer. Call close() immediately after the bind."""
+    """Private in-memory signer with a public-only verifier projection."""
 
-    _seed: bytearray
+    _seed: bytearray = field(repr=False)
     identity_sha256: str
+    _public_key_hex: str = ""
+
+    def __post_init__(self) -> None:
+        """Project only public verifier material while the seed is in custody."""
+        public = self.private_key().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self._public_key_hex = public.hex()
+
+    @property
+    def public_key_hex(self) -> str:
+        """Exact raw 32-byte Ed25519 public key as lowercase hexadecimal."""
+        return self._public_key_hex
+
+    @property
+    def signer_epoch(self) -> str:
+        """Lowercase SHA-256 hexadecimal of the raw 32-byte public key."""
+        return hashlib.sha256(bytes.fromhex(self._public_key_hex)).hexdigest()
+
+    @property
+    def epoch(self) -> str:
+        """Compatibility-free short name for the public deterministic signer epoch."""
+        return self.signer_epoch
 
     def private_key(self) -> Ed25519PrivateKey:
         if not self._seed:
@@ -264,6 +286,36 @@ def verify_and_derive_caduceus(pin: str, *, key_dir: Path = Path("/root/key"), v
         return DerivedCaduceusSigner(seed, identity)
     finally:
         for value in (pin_bytes, raw_skeleton, canonical_identity, legacy_passphrase, suite_password, username, stored_pin):
+            _wipe(value)
+
+
+def bind_derived_caduceus(*, key_dir: Path = Path("/root/key"), vault_dir: Path = Path("/vault/.keys")) -> DerivedCaduceusSigner:
+    """Bind the current encrypted Caduceus credential to its in-memory signer.
+
+    This root-only staff-startup API deliberately has no PIN argument. It opens
+    the existing Keyman service suite and fixed Caduceus credential in-process,
+    derives from the stored PIN, and returns only the signing seat.
+    """
+    _require_root()
+    raw_skeleton = _read(key_dir / "skeleton.key")
+    canonical_identity = bytearray()
+    legacy_passphrase = bytearray()
+    suite_password = bytearray()
+    username = bytearray()
+    stored_pin = bytearray()
+    seed = bytearray()
+    try:
+        canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
+        legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
+        identity = _identity_for_skeleton(canonical_identity)
+        suite_password = _service_suite_password(legacy_passphrase, vault_dir)
+        username, stored_pin = _credential(identity, suite_password, vault_dir)
+        seed = bytearray(hashlib.sha256(identity.encode("ascii") + b"\x00" + bytes(stored_pin)).digest())
+        signer = DerivedCaduceusSigner(seed, identity)
+        seed = bytearray()
+        return signer
+    finally:
+        for value in (raw_skeleton, canonical_identity, legacy_passphrase, suite_password, username, stored_pin, seed):
             _wipe(value)
 
 
