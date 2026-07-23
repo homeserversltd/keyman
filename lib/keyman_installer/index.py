@@ -197,6 +197,20 @@ class KeymanInstaller:
             "skeleton_key": p.skeleton_key.exists(),
             "service_suite_key": p.service_suite_key.exists(),
         }
+        seed_action = Action(
+            "seed-caduceus-key",
+            str(p.vault_dir / "caduceus.key"),
+            True,
+            detail={"identity": "sha256-raw-skeleton-bytes", "pin": REDACTED},
+        )
+        if all(checks[name] for name in ("runtime_dir", "newkey_sh", "key_dir", "vault_dir", "skeleton_key", "service_suite_key")):
+            if not (p.vault_dir / "caduceus.key").is_file() or self.options.force_caduceus_pin:
+                self._require_root_for_mutations()
+            self._do_seed_caduceus_key(seed_action)
+        else:
+            seed_action.status = "blocked"
+            seed_action.detail["reason"] = "keyman-install-incomplete"
+        checks["caduceus_key"] = (p.vault_dir / "caduceus.key").is_file()
         ok = all(checks.values())
         return {
             "schema": "keyman.installer.verify.v1",
@@ -212,6 +226,7 @@ class KeymanInstaller:
                 "service": "caduceus",
                 "private_material": REDACTED,
             },
+            "caduceus_seed": seed_action.receipt(),
             "secret_material": REDACTED,
             "first_missing_signal": "none" if ok else "keyman-install-incomplete",
         }
@@ -646,10 +661,7 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
         file_path=ns.seed_caduceus_pin_file,
         label="Caduceus seed PIN",
     )
-    if caduceus_seed_pin is not None and not ns.install_caduceus:
-        raise InstallerError("Caduceus PIN seeding requires --install-caduceus")
-    if ns.force_caduceus_pin and caduceus_seed_pin is None:
-        raise InstallerError("--force-caduceus-pin requires --seed-caduceus-pin")
+    caduceus_seed_pin = caduceus_seed_pin or "1"
 
     set_admin_secret = ns.set_admin_secret if ns.set_admin_secret is not None else bool(profile.get("set_admin_secret", False))
     write_deploy_secret = ns.write_deploy_secret if ns.write_deploy_secret is not None else bool(profile.get("write_deploy_secret", False))
@@ -724,8 +736,8 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-nas-key", action="store_true")
     parser.add_argument("--no-mount-exchange-tmpfs", action="store_true")
     parser.add_argument("--replace-existing", action="store_true", help="Replace existing skeleton/service keys; destructive for existing credentials")
-    parser.add_argument("--install-caduceus", action="store_true", help="Declare the optional Caduceus extension")
-    parser.add_argument("--seed-caduceus-pin", nargs="?", const="1", help="Seed Caduceus through newkey.sh; bare option uses PIN 1")
+    parser.add_argument("--install-caduceus", action="store_true", help="Compatibility declaration; native Caduceus seeding is already enabled")
+    parser.add_argument("--seed-caduceus-pin", nargs="?", const="1", help="Override the native Caduceus seed PIN; bare option uses PIN 1")
     parser.add_argument("--seed-caduceus-pin-env", help="Environment variable containing the Caduceus seed PIN")
     parser.add_argument("--seed-caduceus-pin-file", help="File containing the Caduceus seed PIN")
     parser.add_argument("--force-caduceus-pin", action="store_true", help="Replace an existing caduceus.key through the standard ceremony")
