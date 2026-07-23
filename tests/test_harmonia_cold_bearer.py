@@ -31,6 +31,16 @@ class HarmoniaColdBearerFixtureTests(unittest.TestCase):
             ]))
             installer = KeymanInstaller(options)
             installer.plan()
+            original_run = installer._run
+
+            def run_with_caduceus_ceremony(argv, **kwargs):
+                if Path(argv[0]).name == "newkey.sh":
+                    vault_dir.mkdir(parents=True, exist_ok=True)
+                    (vault_dir / "caduceus.key").write_bytes(b"encrypted-fixture")
+                    return None
+                return original_run(argv, **kwargs)
+
+            installer._run = run_with_caduceus_ceremony  # type: ignore[method-assign]
             with mock.patch.object(installer, "_require_root_for_mutations"):
                 receipt = installer.run()
             self.assertTrue(receipt["ok"])
