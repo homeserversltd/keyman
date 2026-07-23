@@ -24,3 +24,17 @@ sudo KEYMAN_ADMIN_SECRET='<operator-local-secret>' python3 index.py install --pr
 ```
 
 Receipts redact secret material.
+
+## Optional Caduceus seed extension
+
+The Keyman installer can extend a Keyman installation with a Caduceus
+credential after the vault hierarchy stands. The extension always invokes the
+existing `newkey.sh` ceremony; it does not implement a second key writer.
+
+```bash
+sudo python3 index.py install --profile vault-only --install-caduceus --seed-caduceus-pin
+```
+
+The bare seed option uses PIN `1`. Supply an environment or file source for a
+different PIN. The receipt redacts the PIN. Existing `caduceus.key` is
+preserved unless `--force-caduceus-pin` is explicit.

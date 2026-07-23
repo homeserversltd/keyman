@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -106,6 +107,77 @@ class KeymanInstallerCliTests(unittest.TestCase):
         self.assertIn("set-admin-secret", actions)
         self.assertIn("rotate-service-suite", actions)
         self.assertEqual(payload["secret_material"], "[REDACTED]")
+
+    def test_caduceus_seed_plan_uses_default_pin_and_redacts_it(self) -> None:
+        result = self.run_index("plan", "--install-caduceus", "--seed-caduceus-pin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('"1"', result.stdout)
+        payload = json.loads(result.stdout)
+        action = next(action for action in payload["actions"] if action["name"] == "seed-caduceus-key")
+        self.assertEqual(action["detail"], {"identity": "sha256-raw-skeleton-bytes", "pin": "[REDACTED]"})
+
+    def test_caduceus_seed_requires_extension_and_force_requires_seed(self) -> None:
+        seed_without_extension = self.run_index("plan", "--seed-caduceus-pin")
+        self.assertNotEqual(seed_without_extension.returncode, 0)
+        self.assertNotIn("1", seed_without_extension.stderr)
+        force_without_seed = self.run_index("plan", "--install-caduceus", "--force-caduceus-pin")
+        self.assertNotEqual(force_without_seed.returncode, 0)
+
+    def test_caduceus_seed_uses_untouched_ceremony_and_is_idempotent(self) -> None:
+        from keyman_installer.index import KeymanInstaller, build_options, build_parser
+
+        with tempfile.TemporaryDirectory(prefix="keyman-caduceus-fake-root-") as temporary:
+            root = Path(temporary)
+            runtime = root / "vault/keyman"
+            key_dir = root / "root/key"
+            vault = root / "vault/.keys"
+            exchange = root / "mnt/keyexchange"
+            runtime.mkdir(parents=True)
+            key_dir.mkdir(parents=True)
+            vault.mkdir(parents=True)
+            exchange.mkdir(parents=True)
+            raw_skeleton = b"raw-skeleton-bytes\n"
+            (key_dir / "skeleton.key").write_bytes(raw_skeleton)
+            (vault / "service_suite.key").write_bytes(b"fixture")
+            ceremony = runtime / "newkey.sh"
+            ceremony.write_text("#!/bin/sh\n", encoding="utf-8")
+            ceremony.chmod(0o700)
+            args = [
+                "install", "--install-caduceus", "--seed-caduceus-pin", "test-pin",
+                "--no-build-crypto", "--no-copy-runtime", "--no-init-vault", "--no-nas-key", "--no-mount-exchange-tmpfs",
+                "--runtime-dir", str(runtime), "--key-dir", str(key_dir), "--vault-dir", str(vault), "--exchange-dir", str(exchange),
+            ]
+            installer = KeymanInstaller(build_options(build_parser().parse_args(args)))
+            calls: list[list[str]] = []
+
+            def ceremony_run(argv, **_):
+                calls.append(argv)
+                (vault / "caduceus.key").write_bytes(b"encrypted-fixture")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            installer._run = ceremony_run  # type: ignore[method-assign]
+            installer._require_root_for_mutations = lambda: None  # type: ignore[method-assign]
+            receipt = installer.run()
+            self.assertTrue(receipt["ok"])
+            self.assertEqual(calls, [[str(ceremony), "caduceus", __import__("hashlib").sha256(raw_skeleton).hexdigest(), "test-pin"]])
+            self.assertEqual(stat.S_IMODE((vault / "caduceus.key").stat().st_mode), 0o600)
+            self.assertNotIn("test-pin", json.dumps(receipt))
+
+            repeated = KeymanInstaller(build_options(build_parser().parse_args(args)))
+            repeated._run = ceremony_run  # type: ignore[method-assign]
+            repeated._require_root_for_mutations = lambda: None  # type: ignore[method-assign]
+            repeat_receipt = repeated.run()
+            action = next(item for item in repeat_receipt["actions"] if item["name"] == "seed-caduceus-key")
+            self.assertEqual(action["status"], "skipped")
+            self.assertEqual(action["detail"]["reason"], "exists")
+            self.assertEqual(len(calls), 1)
+
+            forced_args = [*args, "--force-caduceus-pin"]
+            forced = KeymanInstaller(build_options(build_parser().parse_args(forced_args)))
+            forced._run = ceremony_run  # type: ignore[method-assign]
+            forced._require_root_for_mutations = lambda: None  # type: ignore[method-assign]
+            forced.run()
+            self.assertEqual(len(calls), 2)
 
     def test_verify_receipt_names_redacted_caduceus_access_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

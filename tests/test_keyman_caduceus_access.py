@@ -85,6 +85,14 @@ class CaduceusAccessTests(unittest.TestCase):
             self.assertEqual(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(), FIXTURE_PUBLIC)
         self.assertEqual(signer._seed, bytearray())
 
+    def test_identity_hashes_raw_skeleton_bytes_not_legacy_canonical_bytes(self) -> None:
+        raw = b"fixture-skeleton\ntrailing-bytes"
+        self.assertNotEqual(
+            access._identity_for_raw_skeleton(bytearray(raw)),
+            access._identity_for_skeleton(access._canonical_skeleton_identity_bytes(bytearray(raw))),
+        )
+        self.assertEqual(access._identity_for_raw_skeleton(bytearray(raw)), hashlib.sha256(raw).hexdigest())
+
     def test_bind_derived_uses_current_credential_and_projects_only_public_material(self) -> None:
         expected_epoch = hashlib.sha256(bytes.fromhex(FIXTURE_PUBLIC)).hexdigest()
         with self.derive(FIXTURE_PIN) as presented, self.bind() as bound:
@@ -114,10 +122,13 @@ class CaduceusAccessTests(unittest.TestCase):
         with self.assertRaises(access.CaduceusAccessRefused):
             self.bind()
 
-    def test_newline_terminated_skeleton_uses_exact_legacy_passphrase_and_identity(self) -> None:
-        self.write_skeleton(FIXTURE_SKELETON + b"\n")
+    def test_newline_terminated_skeleton_uses_legacy_passphrase_and_raw_identity(self) -> None:
+        raw_skeleton = FIXTURE_SKELETON + b"\n"
+        self.write_skeleton(raw_skeleton)
+        raw_identity = hashlib.sha256(raw_skeleton).hexdigest()
+        self.write_credential(FIXTURE_PIN, identity=raw_identity)
         with self.derive(FIXTURE_PIN) as signer:
-            self.assertEqual(signer.identity_sha256, FIXTURE_IDENTITY)
+            self.assertEqual(signer.identity_sha256, raw_identity)
         identity_bytes = access._canonical_skeleton_identity_bytes(bytearray(b"  keep-space  \n"))
         self.assertEqual(identity_bytes, bytearray(b"  keep-space  "))
         self.assertEqual(access._legacy_skeleton_passphrase(identity_bytes), bytearray(b"  keep-space  "))
