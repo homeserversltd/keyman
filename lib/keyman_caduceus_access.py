@@ -1,11 +1,10 @@
 """Root-only in-memory Keyman access for the Caduceus staff process.
 
-Canonical Caduceus identity bytes are the Keyman skeleton secret selected with
-legacy ``fgets(buffer, 512, ...)`` semantics: bytes through the first ``LF`` in
-that 511-byte read window, with that one ``LF`` removed.  They are not broad
-raw-file hashing.  The legacy service-suite PBKDF2 passphrase is separately the
-canonical secret's C-string prefix.  Neither interpretation uses broad
-whitespace stripping.
+Caduceus identity is SHA-256 of the raw Keyman skeleton file bytes, exactly as
+the Keyman newkey ceremony records it. The legacy service-suite PBKDF2
+passphrase remains separately the canonical secret selected with
+``fgets(buffer, 512, ...)`` semantics and its C-string prefix. Neither
+interpretation uses broad whitespace stripping.
 
 Python can overwrite mutable bytearrays best-effort.  It cannot honestly erase
 immutable ``str``/``bytes`` values or cryptography key objects; this membrane
@@ -86,6 +85,12 @@ def _legacy_skeleton_passphrase(identity_bytes: bytearray) -> bytearray:
 
 def _identity_for_skeleton(canonical_identity: bytearray) -> str:
     return hashlib.sha256(bytes(canonical_identity)).hexdigest()
+
+
+def _identity_for_raw_skeleton(raw_skeleton: bytearray) -> str:
+    if not raw_skeleton:
+        raise CaduceusAccessRefused("caduceus-skeleton-malformed")
+    return hashlib.sha256(bytes(raw_skeleton)).hexdigest()
 
 
 def _decrypt_openssl(ciphertext: bytearray, password: bytearray) -> bytearray:
@@ -277,7 +282,7 @@ def verify_and_derive_caduceus(pin: str, *, key_dir: Path = Path("/root/key"), v
     try:
         canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
         legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
-        identity = _identity_for_skeleton(canonical_identity)
+        identity = _identity_for_raw_skeleton(raw_skeleton)
         suite_password = _service_suite_password(legacy_passphrase, vault_dir)
         username, stored_pin = _credential(identity, suite_password, vault_dir)
         if not hmac.compare_digest(bytes(stored_pin), bytes(pin_bytes)):
@@ -307,7 +312,7 @@ def bind_derived_caduceus(*, key_dir: Path = Path("/root/key"), vault_dir: Path 
     try:
         canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
         legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
-        identity = _identity_for_skeleton(canonical_identity)
+        identity = _identity_for_raw_skeleton(raw_skeleton)
         suite_password = _service_suite_password(legacy_passphrase, vault_dir)
         username, stored_pin = _credential(identity, suite_password, vault_dir)
         seed = bytearray(hashlib.sha256(identity.encode("ascii") + b"\x00" + bytes(stored_pin)).digest())
@@ -335,7 +340,7 @@ def provision_caduceus(initial_pin: str, *, key_dir: Path = Path("/root/key"), v
     try:
         canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
         legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
-        identity = _identity_for_skeleton(canonical_identity)
+        identity = _identity_for_raw_skeleton(raw_skeleton)
         suite_password = _service_suite_password(legacy_passphrase, vault_dir)
         plaintext = _credential_plaintext(identity, pin_bytes)
         ciphertext = _encrypt_openssl(plaintext, suite_password)
@@ -362,7 +367,7 @@ def change_caduceus_pin(old_pin: str, new_pin: str, *, key_dir: Path = Path("/ro
     try:
         canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
         legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
-        identity = _identity_for_skeleton(canonical_identity)
+        identity = _identity_for_raw_skeleton(raw_skeleton)
         suite_password = _service_suite_password(legacy_passphrase, vault_dir)
         username, stored_pin = _credential(identity, suite_password, vault_dir)
         if not hmac.compare_digest(bytes(stored_pin), bytes(old_bytes)):

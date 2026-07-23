@@ -75,6 +75,9 @@ class InstallOptions:
     mount_exchange_tmpfs: bool
     restart_ssh: bool
     replace_existing: bool
+    install_caduceus: bool
+    caduceus_seed_pin: str | None
+    force_caduceus_pin: bool
     receipt_path: Path | None
     paths: InstallPaths
 
@@ -121,6 +124,18 @@ class KeymanInstaller:
             self.actions.append(Action("ensure-service-suite-key", str(p.service_suite_key), True, detail={"secret_material": REDACTED}))
             if self.options.create_nas_key:
                 self.actions.append(Action("ensure-nas-key", str(p.nas_key), True, detail={"secret_material": REDACTED}))
+        if self.options.caduceus_seed_pin is not None:
+            self.actions.append(
+                Action(
+                    "seed-caduceus-key",
+                    str(p.vault_dir / "caduceus.key"),
+                    True,
+                    detail={
+                        "identity": "sha256-raw-skeleton-bytes",
+                        "pin": REDACTED,
+                    },
+                )
+            )
         if self.options.set_admin_secret:
             self.actions.append(
                 Action(
@@ -343,6 +358,29 @@ class KeymanInstaller:
             return
         master = self._read_master_secret()
         self._write_encrypted_key(target, "nas", master, master)
+        action.status = "done"
+
+    def _do_seed_caduceus_key(self, action: Action) -> None:
+        """Seed Caduceus only through the existing Keyman newkey ceremony."""
+        target = self.options.paths.vault_dir / "caduceus.key"
+        if target.exists() and not self.options.force_caduceus_pin:
+            action.status = "skipped"
+            action.detail["reason"] = "exists"
+            return
+        pin = self.options.caduceus_seed_pin
+        if pin is None:
+            raise InstallerError("Caduceus PIN seed was not selected")
+        self._reject_unquoted_keyman_value(pin, "Caduceus PIN")
+        skeleton = self.options.paths.skeleton_key
+        ceremony = self.options.paths.runtime_dir / "newkey.sh"
+        required = (skeleton, self.options.paths.service_suite_key, ceremony)
+        if not all(path.is_file() for path in required):
+            raise InstallerError("caduceus-key-seed-prerequisite-missing")
+        identity = hashlib.sha256(skeleton.read_bytes()).hexdigest()
+        self._run([str(ceremony), "caduceus", identity, pin])
+        if not target.is_file():
+            raise InstallerError("caduceus-key-seed-missing-after-ceremony")
+        os.chmod(target, 0o600)
         action.status = "done"
 
     def _do_set_admin_secret(self, action: Action) -> None:
@@ -602,6 +640,16 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
         file_path=ns.new_service_suite_secret_file,
         label="new service-suite secret",
     )
+    caduceus_seed_pin = resolve_secret(
+        literal=ns.seed_caduceus_pin,
+        env_name=ns.seed_caduceus_pin_env,
+        file_path=ns.seed_caduceus_pin_file,
+        label="Caduceus seed PIN",
+    )
+    if caduceus_seed_pin is not None and not ns.install_caduceus:
+        raise InstallerError("Caduceus PIN seeding requires --install-caduceus")
+    if ns.force_caduceus_pin and caduceus_seed_pin is None:
+        raise InstallerError("--force-caduceus-pin requires --seed-caduceus-pin")
 
     set_admin_secret = ns.set_admin_secret if ns.set_admin_secret is not None else bool(profile.get("set_admin_secret", False))
     write_deploy_secret = ns.write_deploy_secret if ns.write_deploy_secret is not None else bool(profile.get("write_deploy_secret", False))
@@ -628,6 +676,9 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
         mount_exchange_tmpfs=not ns.no_mount_exchange_tmpfs,
         restart_ssh=ns.restart_ssh,
         replace_existing=ns.replace_existing,
+        install_caduceus=ns.install_caduceus,
+        caduceus_seed_pin=caduceus_seed_pin,
+        force_caduceus_pin=ns.force_caduceus_pin,
         receipt_path=Path(ns.receipt) if ns.receipt else None,
         paths=paths,
     )
@@ -673,6 +724,11 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-nas-key", action="store_true")
     parser.add_argument("--no-mount-exchange-tmpfs", action="store_true")
     parser.add_argument("--replace-existing", action="store_true", help="Replace existing skeleton/service keys; destructive for existing credentials")
+    parser.add_argument("--install-caduceus", action="store_true", help="Declare the optional Caduceus extension")
+    parser.add_argument("--seed-caduceus-pin", nargs="?", const="1", help="Seed Caduceus through newkey.sh; bare option uses PIN 1")
+    parser.add_argument("--seed-caduceus-pin-env", help="Environment variable containing the Caduceus seed PIN")
+    parser.add_argument("--seed-caduceus-pin-file", help="File containing the Caduceus seed PIN")
+    parser.add_argument("--force-caduceus-pin", action="store_true", help="Replace an existing caduceus.key through the standard ceremony")
     parser.add_argument("--restart-ssh", action="store_true")
     parser.add_argument("--receipt", help="Write JSON receipt to this path as well as stdout")
     parser.add_argument("--dry-run", action="store_true", help="Plan without mutating even under install")
