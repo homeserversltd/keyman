@@ -27,7 +27,7 @@ class HarmoniaColdBearerFixtureTests(unittest.TestCase):
                 "--key-dir", str(key_dir),
                 "--vault-dir", str(vault_dir),
                 "--exchange-dir", str(root / "exchange"),
-                "--no-build-crypto", "--no-mount-exchange-tmpfs", "--no-nas-key",
+                "--no-mount-exchange-tmpfs", "--no-nas-key",
             ]))
             installer = KeymanInstaller(options)
             installer.plan()
