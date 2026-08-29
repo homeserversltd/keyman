@@ -206,6 +206,30 @@ class CaduceusAccessTests(unittest.TestCase):
             self.assertEqual(rebound.public_key_hex, presented.public_key_hex)
             self.assertEqual(rebound.signer_epoch, presented.signer_epoch)
 
+    def test_pin_reset_replaces_existing_credential_without_old_pin(self) -> None:
+        self.write_credential("unknown-old-pin")
+        status = self.root_call(access.reset_caduceus_pin, FIXTURE_NEW_PIN)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["operation"], "pin-reset")
+        with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-pin-refused"):
+            self.derive(FIXTURE_PIN)
+        with self.derive(FIXTURE_NEW_PIN):
+            pass
+
+    def test_pin_reset_creates_absent_credential(self) -> None:
+        (self.vault_dir / "caduceus.key").unlink()
+        status = self.root_call(access.reset_caduceus_pin, FIXTURE_NEW_PIN)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["operation"], "pin-reset")
+        with self.derive(FIXTURE_NEW_PIN):
+            pass
+
+    def test_pin_reset_refuses_non_root_before_key_access(self) -> None:
+        with mock.patch.object(access.os, "geteuid", return_value=1000), mock.patch.object(access, "_read") as read:
+            with self.assertRaisesRegex(access.CaduceusAccessRefused, "caduceus-staff-root-required"):
+                access.reset_caduceus_pin(FIXTURE_NEW_PIN, key_dir=self.key_dir, vault_dir=self.vault_dir)
+        read.assert_not_called()
+
     def test_replace_then_directory_fsync_failure_is_commit_uncertain(self) -> None:
         target = self.vault_dir / "caduceus.key"
         before = target.read_bytes()

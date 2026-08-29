@@ -381,6 +381,30 @@ def change_caduceus_pin(old_pin: str, new_pin: str, *, key_dir: Path = Path("/ro
             _wipe(value)
 
 
+def reset_caduceus_pin(new_pin: str, *, key_dir: Path = Path("/root/key"), vault_dir: Path = Path("/vault/.keys")) -> dict[str, object]:
+    """Atomically replace the fixed credential without consulting its old PIN."""
+    _require_root()
+    new_bytes = _pin_bytes(new_pin)
+    raw_skeleton = _read(key_dir / "skeleton.key")
+    canonical_identity = bytearray()
+    legacy_passphrase = bytearray()
+    suite_password = bytearray()
+    plaintext = bytearray()
+    ciphertext = bytearray()
+    try:
+        canonical_identity = _canonical_skeleton_identity_bytes(raw_skeleton)
+        legacy_passphrase = _legacy_skeleton_passphrase(canonical_identity)
+        identity = _identity_for_raw_skeleton(raw_skeleton)
+        suite_password = _service_suite_password(legacy_passphrase, vault_dir)
+        plaintext = _credential_plaintext(identity, new_bytes)
+        ciphertext = _encrypt_openssl(plaintext, suite_password)
+        _atomic_ciphertext_write(vault_dir / _CADUCEUS_NAME, ciphertext, replace=True)
+        return {"schema": "keyman.caduceus_access.status.v1", "ok": True, "operation": "pin-reset", "private_material": "[REDACTED]"}
+    finally:
+        for value in (new_bytes, raw_skeleton, canonical_identity, legacy_passphrase, suite_password, plaintext, ciphertext):
+            _wipe(value)
+
+
 def access_module_importable(path: Path) -> bool:
     """Secret-free installed-runtime import check, including crypto dependency."""
     name = "_keyman_caduceus_access_install_check"
