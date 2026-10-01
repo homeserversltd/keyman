@@ -1,0 +1,198 @@
+when:
+  - event: push
+    branch: main
+
+steps:
+  - name: release-publish
+    image: python:3.12-alpine
+    environment:
+      FORGEJO_TOKEN:
+        from_secret: FORGEJO_TOKEN
+    commands:
+      - |
+        set -eu
+        python3 - <<'PY'
+        import urllib.request
+
+        with urllib.request.urlopen("http://192.168.123.1:7100/v1/trust/ca-bundle") as response:
+            ca_bundle = response.read()
+        with open("/tmp/house-ca.pem", "wb") as bundle_file:
+            bundle_file.write(ca_bundle)
+        PY
+        test -s /tmp/house-ca.pem
+        export SSL_CERT_FILE=/tmp/house-ca.pem
+        python3 ci/release_publish.py
+  - name: ci-outcome-keyman
+    image: python:3.12-alpine
+    backend_options:
+      docker:
+        user: "0"
+    when:
+      - status: [success, failure]
+        event: push
+        branch: main
+    environment:
+      KETHER_URL:
+        from_secret: KETHER_URL
+      FORGEJO_TOKEN:
+        from_secret: FORGEJO_TOKEN
+    commands:
+      - |
+        set -eu
+        KETHER_ENDPOINT="$${KETHER_URL:-}"
+        KETHER_ENDPOINT="$${KETHER_ENDPOINT%/}"
+        if [ -z "$${KETHER_ENDPOINT}" ]; then
+          KETHER_ENDPOINT="http://192.168.123.1:7100"
+        fi
+        export KETHER_ENDPOINT
+        python3 - <<'PY'
+        import http.client
+        import json
+        import os
+        import ssl
+        import sys
+        import tempfile
+        import urllib.error
+        import urllib.request
+        from datetime import datetime, timezone
+
+        CA_URL = "http://192.168.123.1:7100/v1/trust/ca-bundle"
+        SEAT_URL = "https://git.home.arpa/HOMESERVERSLTD/fulcrum/raw/branch/main/schema/kether.ci_pipeline_outcome.v1.json"
+        OUTCOME_PATH = "/v1/ci/pipeline-outcome"
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise urllib.error.URLError("redirect refused")
+
+        def refusal(message):
+            print(f"ci-outcome-keyman: refusal: {message}", file=sys.stderr)
+
+        def load_seat():
+            token = os.environ.get("FORGEJO_TOKEN", "")
+            ca_path = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix="kether-ca-", suffix=".pem", delete=False) as ca_file:
+                    ca_path = ca_file.name
+                    ca_request = urllib.request.Request(CA_URL, method="GET")
+                    ca_opener = urllib.request.build_opener(NoRedirect())
+                    with ca_opener.open(ca_request, timeout=15) as response:
+                        ca_status = response.status
+                        ca_raw = response.read()
+                    if ca_status < 200 or ca_status >= 300 or not ca_raw:
+                        raise RuntimeError(f"CA bundle HTTP {ca_status}")
+                    ca_file.write(ca_raw)
+                context = ssl.create_default_context(cafile=ca_path)
+                opener = urllib.request.build_opener(
+                    NoRedirect(), urllib.request.HTTPSHandler(context=context),
+                )
+                seat_request = urllib.request.Request(
+                    SEAT_URL,
+                    headers={"Authorization": f"token {token}"},
+                    method="GET",
+                )
+                with opener.open(seat_request, timeout=15) as response:
+                    seat_status = response.status
+                    seat_raw = response.read()
+                if seat_status < 200 or seat_status >= 300:
+                    raise RuntimeError(f"seat HTTP {seat_status}")
+                try:
+                    seat = json.loads(seat_raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("seat invalid JSON") from exc
+            finally:
+                if ca_path is not None:
+                    try:
+                        os.unlink(ca_path)
+                    except OSError:
+                        pass
+
+            if not isinstance(seat, dict) or seat.get("schema") != "kether.ci_pipeline_outcome.v1":
+                raise RuntimeError("seat schema != kether.ci_pipeline_outcome.v1")
+            report = seat.get("report")
+            if not isinstance(report, dict):
+                raise RuntimeError("seat report is invalid")
+            fields = report.get("fields")
+            if not isinstance(fields, dict):
+                raise RuntimeError("seat report.fields is invalid")
+            schema_field = fields.get("schema")
+            if not isinstance(schema_field, dict) or not isinstance(schema_field.get("const"), str):
+                raise RuntimeError("seat report.fields.schema.const is invalid")
+            if schema_field["const"] != seat["schema"]:
+                raise RuntimeError("seat report.fields.schema.const is foreign")
+            required = report.get("required")
+            if not isinstance(required, list) or not required or any(
+                not isinstance(field, str) or not field for field in required
+            ):
+                raise RuntimeError("seat report.required is invalid")
+            return seat, fields, required, opener
+
+        def build_payload(fields, required):
+            status_field = fields.get("status")
+            status_enum = status_field.get("enum") if isinstance(status_field, dict) else None
+            if not isinstance(status_enum, list):
+                status_enum = []
+            candidate_status = os.environ.get("CI_PIPELINE_STATUS", "")
+            status = candidate_status if candidate_status and candidate_status in status_enum else "failure"
+            if status not in status_enum:
+                raise RuntimeError("seat status enum does not permit failure")
+            try:
+                pipeline_number = int(os.environ.get("CI_PIPELINE_NUMBER", ""))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("CI_PIPELINE_NUMBER is not an integer") from exc
+            payload = {
+                "schema": fields["schema"]["const"],
+                "repo_locator": "forgejo:HOMESERVERSLTD/keyman",
+                "commit_sha": os.environ.get("CI_COMMIT_SHA", ""),
+                "pipeline_number": pipeline_number,
+                "status": status,
+                "event": os.environ.get("CI_PIPELINE_EVENT", ""),
+                "branch": os.environ.get("CI_COMMIT_BRANCH", ""),
+                "forge_url": os.environ.get("CI_PIPELINE_FORGE_URL", ""),
+                "reporter": "woodpecker",
+                "finished_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            missing = [
+                field for field in required
+                if field not in payload or payload[field] is None or payload[field] == ""
+            ]
+            if missing:
+                raise RuntimeError("payload missing required fields: " + ", ".join(missing))
+            return payload
+
+        def post_outcome(opener, payload):
+            endpoint = os.environ["KETHER_ENDPOINT"].rstrip("/") + OUTCOME_PATH
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with opener.open(request, timeout=15) as response:
+                    status = response.status
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                raw = exc.read()
+            print(f"ci-outcome-keyman: http_status={status}")
+            print("response_body=")
+            sys.stdout.write(raw.decode("utf-8", errors="replace"))
+            print()
+            if status < 200 or status >= 300:
+                refusal(f"POST {endpoint} returned HTTP {status}")
+
+        def main():
+            try:
+                _seat, fields, required, opener = load_seat()
+                payload = build_payload(fields, required)
+                post_outcome(opener, payload)
+            except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError, OSError) as exc:
+                refusal(f"transport failure: {exc}")
+            except Exception as exc:
+                refusal(str(exc))
+
+        main()
+        PY
