@@ -1154,16 +1154,18 @@ fn cryptsetup_change_key(backing: &str, old_password: &[u8], new_password: &[u8]
     Ok(())
 }
 
-fn cryptsetup_test_passphrase(backing: &str, password: &[u8]) -> Result<bool> {
-    let mut child = Command::new("cryptsetup")
-        .args([
-            "open",
-            "--test-passphrase",
-            "--key-slot",
-            "0",
-            "--key-file",
-            "-",
-        ])
+fn cryptsetup_test_passphrase(
+    backing: &str,
+    password: &[u8],
+    slot_zero_only: bool,
+) -> Result<bool> {
+    let mut command = Command::new("cryptsetup");
+    command.args(["open", "--test-passphrase"]);
+    if slot_zero_only {
+        command.args(["--key-slot", "0"]);
+    }
+    let mut child = command
+        .args(["--key-file", "-"])
         .arg(backing)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1203,12 +1205,12 @@ fn native_update_luks(
     }
 
     cryptsetup_change_key(&backing, old_password.as_bytes(), new_password.as_bytes())?;
-    if !cryptsetup_test_passphrase(&backing, new_password.as_bytes())? {
+    if !cryptsetup_test_passphrase(&backing, new_password.as_bytes(), true)? {
         return Err(KeymanError::Io(
             "new encrypted drive key verification failed",
         ));
     }
-    if cryptsetup_test_passphrase(&backing, old_password.as_bytes())? {
+    if cryptsetup_test_passphrase(&backing, old_password.as_bytes(), false)? {
         return Err(KeymanError::Io("old encrypted drive key is still accepted"));
     }
 
