@@ -2,12 +2,14 @@ use aes::Aes256;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use serde_json::{Map, Value};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -25,6 +27,7 @@ const MAX_EXPLICIT_OUTPUT_PATH: usize = 256;
 const MAX_FIELD_VALUE: usize = 511;
 const MAX_C_LINE: usize = 1023;
 const MAX_CREDENTIAL_PLAINTEXT: usize = 1023;
+const MAX_SETTINGS_FILE: u64 = 1024 * 1024;
 const CLEANUP_DELAY_SECONDS: u64 = 15;
 const PASSWORD_ALPHABET: &[u8] = b"0123456789abcdef";
 
@@ -972,6 +975,616 @@ fn native_rotate_suite(paths: &Paths, new_password: Option<&str>) -> Result<Valu
     Ok(Value::Object(receipt))
 }
 
+fn validate_luks_drive(drive: &str) -> Result<()> {
+    if !matches!(drive, "nas" | "nas_backup") {
+        return Err(KeymanError::Input(
+            "drive must be exactly nas or nas_backup",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nonempty_field(value: &str, label: &'static str) -> Result<()> {
+    validate_field_value(value.as_bytes())?;
+    if value.is_empty() {
+        return Err(KeymanError::Input(label));
+    }
+    Ok(())
+}
+
+fn captured_command(command: &mut Command, message: &'static str) -> Result<std::process::Output> {
+    command.output().map_err(|_| KeymanError::Io(message))
+}
+
+fn exact_findmnt_source(paths: &Paths, drive: &str) -> Result<String> {
+    let (mount, mapper) = match drive {
+        "nas" => (paths.fixed("mnt/nas"), "/dev/mapper/nas"),
+        "nas_backup" => (paths.fixed("mnt/nas_backup"), "/dev/mapper/nas_backup"),
+        _ => {
+            return Err(KeymanError::Input(
+                "drive must be exactly nas or nas_backup",
+            ))
+        }
+    };
+    let output = captured_command(
+        Command::new("findmnt")
+            .args(["-n", "-o", "SOURCE", "--target"])
+            .arg(mount),
+        "cannot inspect mounted drive",
+    )?;
+    if !output.status.success() {
+        return Err(KeymanError::Io("cannot inspect mounted drive"));
+    }
+    let source = std::str::from_utf8(&output.stdout)
+        .map_err(|_| KeymanError::Io("mounted source is invalid"))?;
+    let source = source.strip_suffix('\n').unwrap_or(source);
+    let source = source.strip_suffix('\r').unwrap_or(source);
+    if source != mapper {
+        return Err(KeymanError::Io("mounted source is not the expected mapper"));
+    }
+    Ok(mapper.to_owned())
+}
+
+fn cryptsetup_backing_device(mapper: &str) -> Result<String> {
+    let output = captured_command(
+        Command::new("cryptsetup").arg("status").arg(mapper),
+        "cannot inspect encrypted mapper",
+    )?;
+    if !output.status.success() {
+        return Err(KeymanError::Io("cannot inspect encrypted mapper"));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| KeymanError::Io("cannot determine encrypted backing device"))?;
+    let mut devices = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("device:").map(str::trim));
+    let device = devices
+        .next()
+        .filter(|device| !device.is_empty() && device.starts_with('/'))
+        .ok_or(KeymanError::Io("cannot determine encrypted backing device"))?;
+    if devices.next().is_some() || device.contains('\0') {
+        return Err(KeymanError::Io("cannot determine encrypted backing device"));
+    }
+    Ok(device.to_owned())
+}
+
+struct SecretMemfd {
+    file: File,
+    length: usize,
+}
+
+impl SecretMemfd {
+    fn new(secret: &[u8]) -> Result<Self> {
+        let name = CString::new("keyman-new-passphrase")
+            .map_err(|_| KeymanError::Io("cannot prepare new passphrase"))?;
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if raw_fd < 0 {
+            return Err(KeymanError::Io("cannot prepare new passphrase"));
+        }
+        let mut file = unsafe { File::from_raw_fd(raw_fd) };
+        file.write_all(secret)
+            .map_err(|_| KeymanError::Io("cannot prepare new passphrase"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| KeymanError::Io("cannot prepare new passphrase"))?;
+        Ok(Self {
+            file,
+            length: secret.len(),
+        })
+    }
+
+    fn raw_fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+}
+
+impl Drop for SecretMemfd {
+    fn drop(&mut self) {
+        let _ = self.file.seek(SeekFrom::Start(0));
+        let zeros = [0u8; 512];
+        let mut remaining = self.length;
+        while remaining > 0 {
+            let amount = remaining.min(zeros.len());
+            if self.file.write_all(&zeros[..amount]).is_err() {
+                break;
+            }
+            remaining -= amount;
+        }
+        let _ = self.file.set_len(0);
+    }
+}
+
+fn feed_child_secret(child: &mut Child, secret: &[u8], message: &'static str) -> Result<()> {
+    let Some(mut input) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(KeymanError::Io(message));
+    };
+    if input.write_all(secret).is_err() {
+        drop(input);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(KeymanError::Io(message));
+    }
+    drop(input);
+    Ok(())
+}
+
+fn cryptsetup_change_key(backing: &str, old_password: &[u8], new_password: &[u8]) -> Result<()> {
+    let new_key = SecretMemfd::new(new_password)?;
+    let inherited_fd = new_key.raw_fd();
+    let mut command = Command::new("cryptsetup");
+    command
+        .args([
+            "luksChangeKey",
+            backing,
+            "/proc/self/fd/3",
+            "-S",
+            "0",
+            "--key-file",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            if inherited_fd != 3 && libc::dup2(inherited_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| KeymanError::Io("cannot change encrypted drive key"))?;
+    feed_child_secret(
+        &mut child,
+        old_password,
+        "cannot provide current encrypted drive key",
+    )?;
+    let status = child
+        .wait()
+        .map_err(|_| KeymanError::Io("cannot change encrypted drive key"))?;
+    if !status.success() {
+        return Err(KeymanError::Io("encrypted drive key change failed"));
+    }
+    Ok(())
+}
+
+fn cryptsetup_test_passphrase(backing: &str, password: &[u8]) -> Result<bool> {
+    let mut child = Command::new("cryptsetup")
+        .args([
+            "open",
+            "--test-passphrase",
+            "--key-slot",
+            "0",
+            "--key-file",
+            "-",
+        ])
+        .arg(backing)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| KeymanError::Io("cannot verify encrypted drive key"))?;
+    feed_child_secret(
+        &mut child,
+        password,
+        "cannot provide encrypted drive verification key",
+    )?;
+    let status = child
+        .wait()
+        .map_err(|_| KeymanError::Io("cannot verify encrypted drive key"))?;
+    Ok(status.success())
+}
+
+fn native_update_luks(
+    paths: &Paths,
+    drive: &str,
+    old_password: &str,
+    new_password: &str,
+) -> Result<Value> {
+    validate_luks_drive(drive)?;
+    validate_nonempty_field(old_password, "old password must not be empty")?;
+    validate_nonempty_field(new_password, "new password must not be empty")?;
+    let _ = format_credentials(drive.as_bytes(), new_password.as_bytes())?;
+
+    let mapper = exact_findmnt_source(paths, drive)?;
+    let backing = cryptsetup_backing_device(&mapper)?;
+    let is_luks = captured_command(
+        Command::new("cryptsetup").arg("isLuks").arg(&backing),
+        "cannot verify encrypted backing device",
+    )?;
+    if !is_luks.status.success() {
+        return Err(KeymanError::Io("backing device is not a LUKS volume"));
+    }
+
+    cryptsetup_change_key(&backing, old_password.as_bytes(), new_password.as_bytes())?;
+    if !cryptsetup_test_passphrase(&backing, new_password.as_bytes())? {
+        return Err(KeymanError::Io(
+            "new encrypted drive key verification failed",
+        ));
+    }
+    if cryptsetup_test_passphrase(&backing, old_password.as_bytes())? {
+        return Err(KeymanError::Io("old encrypted drive key is still accepted"));
+    }
+
+    let _ = native_newkey(paths, drive, drive, new_password)?;
+    let mut receipt = receipt_base("update-luks");
+    receipt.insert("drive".into(), Value::String(drive.to_owned()));
+    receipt.insert("backing_device".into(), Value::String(backing));
+    receipt.insert("key_slot".into(), Value::from(0));
+    receipt.insert("new_passphrase_verified".into(), Value::Bool(true));
+    receipt.insert("old_passphrase_rejected".into(), Value::Bool(true));
+    receipt.insert("keyman_credential_updated".into(), Value::Bool(true));
+    receipt.insert("secret_free".into(), Value::Bool(true));
+    Ok(Value::Object(receipt))
+}
+
+fn json_skip_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        *cursor += 1;
+    }
+}
+
+fn json_string_span(bytes: &[u8], cursor: &mut usize) -> Result<std::ops::Range<usize>> {
+    let start = *cursor;
+    if bytes.get(*cursor) != Some(&b'"') {
+        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+    }
+    *cursor += 1;
+    while let Some(byte) = bytes.get(*cursor).copied() {
+        match byte {
+            b'\\' => {
+                *cursor += 2;
+            }
+            b'"' => {
+                *cursor += 1;
+                return Ok(start..*cursor);
+            }
+            _ => *cursor += 1,
+        }
+    }
+    Err(KeymanError::Input("Transmission settings JSON is invalid"))
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Result<usize> {
+    let Some(first) = bytes.get(start).copied() else {
+        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+    };
+    if first == b'"' {
+        let mut cursor = start;
+        return json_string_span(bytes, &mut cursor).map(|span| span.end);
+    }
+    if matches!(first, b'{' | b'[') {
+        let mut cursor = start + 1;
+        let mut closers = vec![if first == b'{' { b'}' } else { b']' }];
+        while let Some(byte) = bytes.get(cursor).copied() {
+            match byte {
+                b'"' => {
+                    let _ = json_string_span(bytes, &mut cursor)?;
+                    continue;
+                }
+                b'{' => closers.push(b'}'),
+                b'[' => closers.push(b']'),
+                b'}' | b']' => {
+                    if closers.pop() != Some(byte) {
+                        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+                    }
+                    cursor += 1;
+                    if closers.is_empty() {
+                        return Ok(cursor);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+    }
+    let mut cursor = start;
+    while let Some(byte) = bytes.get(cursor) {
+        if matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']') {
+            break;
+        }
+        cursor += 1;
+    }
+    if cursor == start {
+        Err(KeymanError::Input("Transmission settings JSON is invalid"))
+    } else {
+        Ok(cursor)
+    }
+}
+
+fn update_transmission_json(original: &[u8], username: &str, password: &str) -> Result<Vec<u8>> {
+    let document: Value = serde_json::from_slice(original)
+        .map_err(|_| KeymanError::Input("Transmission settings JSON is invalid"))?;
+    if !document.is_object() {
+        return Err(KeymanError::Input(
+            "Transmission settings must be a JSON object",
+        ));
+    }
+
+    let mut cursor = 0;
+    json_skip_whitespace(original, &mut cursor);
+    if original.get(cursor) != Some(&b'{') {
+        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+    }
+    cursor += 1;
+    let mut username_span = None;
+    let mut password_span = None;
+    loop {
+        json_skip_whitespace(original, &mut cursor);
+        if original.get(cursor) == Some(&b'}') {
+            cursor += 1;
+            break;
+        }
+        let key_span = json_string_span(original, &mut cursor)?;
+        let key: String = serde_json::from_slice(&original[key_span])
+            .map_err(|_| KeymanError::Input("Transmission settings JSON is invalid"))?;
+        json_skip_whitespace(original, &mut cursor);
+        if original.get(cursor) != Some(&b':') {
+            return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+        }
+        cursor += 1;
+        json_skip_whitespace(original, &mut cursor);
+        let value_start = cursor;
+        let value_end = json_value_end(original, value_start)?;
+        let target = match key.as_str() {
+            "rpc-username" => Some(&mut username_span),
+            "rpc-password" => Some(&mut password_span),
+            _ => None,
+        };
+        if let Some(target_span) = target {
+            if target_span.is_some() {
+                return Err(KeymanError::Input(
+                    "Transmission settings has a duplicate RPC credential key",
+                ));
+            }
+            if original.get(value_start) != Some(&b'"') {
+                return Err(KeymanError::Input(
+                    "Transmission RPC credential values must be strings",
+                ));
+            }
+            *target_span = Some(value_start..value_end);
+        }
+        cursor = value_end;
+        json_skip_whitespace(original, &mut cursor);
+        match original.get(cursor).copied() {
+            Some(b',') => cursor += 1,
+            Some(b'}') => {
+                cursor += 1;
+                break;
+            }
+            _ => return Err(KeymanError::Input("Transmission settings JSON is invalid")),
+        }
+    }
+    json_skip_whitespace(original, &mut cursor);
+    if cursor != original.len() {
+        return Err(KeymanError::Input("Transmission settings JSON is invalid"));
+    }
+    let username_span = username_span.ok_or(KeymanError::Input(
+        "Transmission settings is missing rpc-username",
+    ))?;
+    let password_span = password_span.ok_or(KeymanError::Input(
+        "Transmission settings is missing rpc-password",
+    ))?;
+    let username_json = serde_json::to_vec(username)
+        .map_err(|_| KeymanError::Input("cannot encode Transmission credentials"))?;
+    let password_json = serde_json::to_vec(password)
+        .map_err(|_| KeymanError::Input("cannot encode Transmission credentials"))?;
+    let mut edits = vec![
+        (username_span, username_json),
+        (password_span, password_json),
+    ];
+    edits.sort_by(|left, right| right.0.start.cmp(&left.0.start));
+    let mut updated = original.to_vec();
+    for (span, replacement) in edits {
+        updated.splice(span, replacement);
+    }
+    Ok(updated)
+}
+
+fn read_transmission_settings(paths: &Paths) -> Result<(PathBuf, Vec<u8>, std::fs::Metadata)> {
+    let path = paths.check_fixed_parent("etc/transmission-daemon/settings.json")?;
+    let before = fs::symlink_metadata(&path)
+        .map_err(|_| KeymanError::Io("cannot inspect Transmission settings"))?;
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > MAX_SETTINGS_FILE {
+        return Err(KeymanError::Io(
+            "Transmission settings is not a supported regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(&path)
+        .map_err(|_| KeymanError::Io("cannot read Transmission settings"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| KeymanError::Io("cannot inspect Transmission settings"))?;
+    if !metadata.is_file() || metadata.dev() != before.dev() || metadata.ino() != before.ino() {
+        return Err(KeymanError::Io("Transmission settings changed during read"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SETTINGS_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| KeymanError::Io("cannot read Transmission settings"))?;
+    if bytes.len() as u64 > MAX_SETTINGS_FILE {
+        return Err(KeymanError::Input(
+            "Transmission settings exceeds the supported size",
+        ));
+    }
+    Ok((path, bytes, metadata))
+}
+
+fn write_transmission_settings_atomic(
+    path: &Path,
+    bytes: &[u8],
+    original: &std::fs::Metadata,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = None;
+    for _ in 0..8 {
+        let candidate = parent.join(format!(".keyman-settings-{}.tmp", random_hex(12)?));
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return Err(KeymanError::Io(
+                    "cannot create Transmission settings update",
+                ))
+            }
+        }
+    }
+    let (temporary_path, mut file) = temporary.ok_or(KeymanError::Io(
+        "cannot allocate Transmission settings update",
+    ))?;
+    let prepare = (|| {
+        file.write_all(bytes)
+            .map_err(|_| KeymanError::Io("cannot write Transmission settings update"))?;
+        if unsafe { libc::fchown(file.as_raw_fd(), original.uid(), original.gid()) } != 0 {
+            return Err(KeymanError::Io(
+                "cannot preserve Transmission settings owner",
+            ));
+        }
+        file.set_permissions(fs::Permissions::from_mode(original.mode() & 0o7777))
+            .map_err(|_| KeymanError::Io("cannot preserve Transmission settings mode"))?;
+        file.sync_all()
+            .map_err(|_| KeymanError::Io("cannot sync Transmission settings update"))?;
+        Ok(())
+    })();
+    if let Err(error) = prepare {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    drop(file);
+
+    let current_matches = fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.dev() == original.dev()
+            && metadata.ino() == original.ino()
+    });
+    if !current_matches {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(KeymanError::Io(
+            "Transmission settings changed before update",
+        ));
+    }
+    if fs::rename(&temporary_path, path).is_err() {
+        let _ = fs::remove_file(temporary_path);
+        return Err(KeymanError::Io("cannot replace Transmission settings"));
+    }
+    if let Ok(directory) = File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CommandStatus {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    spawn_failed: bool,
+}
+
+fn run_systemctl(verb: &'static str) -> CommandStatus {
+    match Command::new("systemctl")
+        .args([verb, "transmission-daemon.service"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => CommandStatus {
+            exit_code: status.code(),
+            signal: status.signal(),
+            spawn_failed: false,
+        },
+        Err(_) => CommandStatus {
+            exit_code: None,
+            signal: None,
+            spawn_failed: true,
+        },
+    }
+}
+
+fn command_status_value(status: CommandStatus) -> Value {
+    let mut value = Map::new();
+    value.insert(
+        "exit_code".into(),
+        status.exit_code.map(Value::from).unwrap_or(Value::Null),
+    );
+    value.insert(
+        "signal".into(),
+        status.signal.map(Value::from).unwrap_or(Value::Null),
+    );
+    value.insert("spawn_failed".into(), Value::Bool(status.spawn_failed));
+    Value::Object(value)
+}
+
+fn native_update_transmission(paths: &Paths, new_password: &str, username: &str) -> Result<Value> {
+    validate_nonempty_field(new_password, "new password must not be empty")?;
+    validate_nonempty_field(username, "username must not be empty")?;
+    let _ = format_credentials(username.as_bytes(), new_password.as_bytes())?;
+
+    let mask_status = run_systemctl("mask");
+    let stop_status = run_systemctl("stop");
+    let update_result = (|| {
+        let (settings_path, original, metadata) = read_transmission_settings(paths)?;
+        let updated = update_transmission_json(&original, username, new_password)?;
+        let _ = native_newkey(paths, "transmission", username, new_password)?;
+        write_transmission_settings_atomic(&settings_path, &updated, &metadata)?;
+        let readback = read_regular_file(
+            &settings_path,
+            MAX_SETTINGS_FILE,
+            "cannot read Transmission settings after update",
+        )?;
+        if readback != updated {
+            return Err(KeymanError::Io(
+                "Transmission settings readback did not match",
+            ));
+        }
+        Ok(())
+    })();
+    let unmask_status = run_systemctl("unmask");
+    update_result?;
+
+    let mut receipt = receipt_base("update-transmission");
+    receipt.insert("service".into(), Value::String("transmission".to_owned()));
+    receipt.insert("settings_updated".into(), Value::Bool(true));
+    receipt.insert("settings_readback_verified".into(), Value::Bool(true));
+    receipt.insert("keyman_credential_updated".into(), Value::Bool(true));
+    receipt.insert("systemctl_mask".into(), command_status_value(mask_status));
+    receipt.insert("systemctl_stop".into(), command_status_value(stop_status));
+    receipt.insert(
+        "systemctl_unmask".into(),
+        command_status_value(unmask_status),
+    );
+    receipt.insert("secret_free".into(), Value::Bool(true));
+    Ok(Value::Object(receipt))
+}
+
 fn receipt_base(operation: &str) -> Map<String, Value> {
     let mut receipt = Map::new();
     receipt.insert("ok".into(), Value::Bool(true));
@@ -984,7 +1597,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman <init|newkey|export|delete|rotate-suite> ..."
+    "Usage: keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman <init|newkey|export|delete|rotate-suite> ... | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username>"
 }
 
 fn run_internal_cleanup(args: &[String]) -> Result<()> {
@@ -1044,6 +1657,34 @@ fn run(args: &mut [String]) -> Result<()> {
     }
     if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
         println!("{}", usage());
+        return Ok(());
+    }
+    if args[0] == "update-luks" {
+        let drive = args
+            .get(1)
+            .ok_or(KeymanError::Usage("invalid update-luks arguments"))?;
+        validate_luks_drive(drive)?;
+        if args.len() != 4 {
+            return Err(KeymanError::Usage("invalid update-luks arguments"));
+        }
+        validate_nonempty_field(&args[2], "old password must not be empty")?;
+        validate_nonempty_field(&args[3], "new password must not be empty")?;
+        let _ = format_credentials(drive.as_bytes(), args[3].as_bytes())?;
+        let paths = Paths::from_environment()?;
+        let receipt = native_update_luks(&paths, drive, &args[2], &args[3])?;
+        emit_receipt(receipt);
+        return Ok(());
+    }
+    if args[0] == "update-transmission" {
+        if args.len() != 3 {
+            return Err(KeymanError::Usage("invalid update-transmission arguments"));
+        }
+        validate_nonempty_field(&args[1], "new password must not be empty")?;
+        validate_nonempty_field(&args[2], "username must not be empty")?;
+        let _ = format_credentials(args[2].as_bytes(), args[1].as_bytes())?;
+        let paths = Paths::from_environment()?;
+        let receipt = native_update_transmission(&paths, &args[1], &args[2])?;
+        emit_receipt(receipt);
         return Ok(());
     }
     let paths = Paths::from_environment()?;
