@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Publish the immutable keyman release flag to Forgejo."""
+"""Publish Keyman's immutable Rust binary release, checksum, and flag."""
 from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import ssl
@@ -17,22 +19,31 @@ from typing import Any, NoReturn
 
 API = "https://git.home.arpa/api/v1"
 WEB = "https://git.home.arpa"
-OWNER_REPO = "HOMESERVERSLTD/keyman"
-
-RELEASE_RETENTION = 20
-RELEASE_PAGE_LIMIT = 50
+REPO = "HOMESERVERSLTD/keyman"
+RELEASE_FLAG_SEAT_URL = (
+    "https://git.home.arpa/HOMESERVERSLTD/caduceus/raw/branch/main/"
+    "schema/estate.release-flag.v1.json"
+)
+RELEASE_FLAG_SCHEMA = "estate.release-flag.v1"
+BINARY_NAME = "keyman-x86_64"
+SIDECAR_NAME = BINARY_NAME + ".sha256"
 FLAG_NAME = "release.flag"
+ASSET_NAMES = {BINARY_NAME, SIDECAR_NAME, FLAG_NAME}
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
-RELEASE_TAG = re.compile(r"^sha-([0-9a-fA-F]{40})$")
-UNIX_TIMESTAMP = re.compile(r"^[0-9]+$")
+RELEASE_TAG = re.compile(r"^sha-([0-9a-f]{40})$")
+DIGEST = re.compile(r"^[0-9a-f]{64}$")
+RETENTION_COUNT = 20
+RELEASE_PAGE_LIMIT = 50
+DOWNLOAD_PREFIX = f"/{REPO}/releases/download/"
+RELEASE_PREFIX = f"/{REPO}/releases/"
 
 
 class ReleaseError(RuntimeError):
-    """A failure that is safe to expose in the CI receipt."""
+    """A publication failure safe to summarize in CI output."""
 
 
 class RetentionFailure(ReleaseError):
-    """A retention failure with a truthful partial-operation receipt."""
+    """A retention failure carrying the operations already observed."""
 
     def __init__(self, message: str, receipt: dict[str, Any]):
         super().__init__(message)
@@ -49,7 +60,7 @@ def ssl_context() -> ssl.SSLContext:
 
 
 def request_url(path_or_url: str) -> str:
-    """Allow only the fixed Forgejo HTTPS host for every request and redirect."""
+    """Restrict API calls, assets, and redirects to Forgejo over HTTPS."""
     parsed = urllib.parse.urlsplit(path_or_url)
     if parsed.scheme:
         if (
@@ -106,126 +117,309 @@ def request(
     raise AssertionError("unreachable")
 
 
-def decode_json(raw: bytes, description: str) -> Any:
+def request_json(
+    method: str,
+    path: str,
+    token: str,
+    *,
+    body: bytes | None = None,
+    content_type: str | None = None,
+    expected_statuses: tuple[int, ...] = (200,),
+) -> Any:
+    status, raw = request(
+        method, path, token, body=body, content_type=content_type
+    )
+    if status not in expected_statuses:
+        fail(f"{method} {path} returned HTTP {status}")
     try:
-        return json.loads(raw)
+        return json.loads(raw) if raw else {}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        fail(f"{description} returned invalid JSON")
-        raise AssertionError("unreachable") from exc
+        raise ReleaseError(f"{method} {path} returned invalid JSON") from exc
 
 
-def flagged_at() -> str:
-    raw = os.environ.get("CI_COMMIT_TIMESTAMP", "")
-    if not UNIX_TIMESTAMP.fullmatch(raw):
-        fail("CI_COMMIT_TIMESTAMP must be a required UNIX timestamp")
-    try:
-        value = datetime.datetime.fromtimestamp(int(raw), datetime.timezone.utc)
-    except (OverflowError, OSError, ValueError) as exc:
-        fail(f"CI_COMMIT_TIMESTAMP is out of range: {exc}")
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+def request_bytes(path_or_url: str, token: str) -> bytes:
+    status, raw = request(
+        "GET", path_or_url, token, accept="application/octet-stream"
+    )
+    if status != 200:
+        fail(f"GET {path_or_url} returned HTTP {status}")
+    return raw
 
 
-def flag_bytes(source_sha: str, pipeline_url: str) -> bytes:
-    if not FULL_SHA.fullmatch(source_sha):
-        fail("CI_COMMIT_SHA must be exactly 40 lowercase hexadecimal characters")
-    if not pipeline_url:
-        fail("CI_PIPELINE_URL is required")
-    payload = {
-        "schema": "estate.release-flag.v1",
-        "component": "keyman",
-        "source_sha": source_sha,
-        "flagged_at": flagged_at(),
-        "pipeline_url": pipeline_url,
-    }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def _repo_path() -> str:
+    return "/repos/" + "/".join(
+        urllib.parse.quote(part, safe="") for part in REPO.split("/")
+    )
 
 
 def release_tag(source_sha: str) -> str:
-    if not FULL_SHA.fullmatch(source_sha):
-        fail("CI_COMMIT_SHA must be exactly 40 lowercase hexadecimal characters")
-    return f"sha-{source_sha}"
+    if not isinstance(source_sha, str) or not FULL_SHA.fullmatch(source_sha):
+        fail("source SHA must be exactly 40 lowercase hexadecimal characters")
+    return "sha-" + source_sha
 
 
 def release_tag_url(source_sha: str) -> str:
     tag = release_tag(source_sha)
-    return f"/repos/{OWNER_REPO}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+    return _repo_path() + "/releases/tags/" + urllib.parse.quote(tag, safe="")
 
 
-def release_page_url(source_sha: str) -> str:
+def release_page_url(release: dict[str, Any], source_sha: str) -> str:
     tag = release_tag(source_sha)
-    return f"{WEB}/{OWNER_REPO}/releases/tag/{urllib.parse.quote(tag, safe='')}"
+    value = release.get("html_url")
+    if value is None:
+        value = WEB + RELEASE_PREFIX + "tag/" + urllib.parse.quote(tag, safe="")
+    parsed = urllib.parse.urlsplit(value)
+    expected_path = RELEASE_PREFIX + "tag/" + urllib.parse.quote(tag, safe="")
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "git.home.arpa"
+        or parsed.netloc != "git.home.arpa"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.path != expected_path
+    ):
+        fail("release URL does not match the fixed Forgejo tag path")
+    return value
 
 
 def read_release(source_sha: str, token: str) -> dict[str, Any] | None:
-    status, raw = request("GET", release_tag_url(source_sha), token)
+    path = release_tag_url(source_sha)
+    status, raw = request("GET", path, token)
     if status == 404:
         return None
     if status != 200:
         fail(f"release lookup returned HTTP {status}")
-    value = decode_json(raw, "release lookup")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("release lookup returned invalid JSON") from exc
     if not isinstance(value, dict):
         fail("release lookup returned a non-object")
     return value
 
 
-def validate_identity(release: dict[str, Any], source_sha: str) -> int:
+def read_release_id(release_id: int, token: str) -> dict[str, Any]:
+    value = request_json("GET", f"{_repo_path()}/releases/{release_id}", token)
+    if not isinstance(value, dict):
+        fail("release lookup by id returned a non-object")
+    return value
+
+
+def validate_release_identity(release: dict[str, Any], source_sha: str) -> int:
+    if not isinstance(release, dict):
+        fail("Forgejo release response is not an object")
     if (
         release.get("tag_name") != release_tag(source_sha)
         or release.get("name") != f"keyman {source_sha[:8]}"
         or release.get("target_commitish") != source_sha
-        or ("target_commit" in release and release["target_commit"] != source_sha)
+        or release.get("draft") is not False
+        or release.get("prerelease") is not False
     ):
-        fail("release identity conflicts with CI_COMMIT_SHA")
+        fail("release identity conflicts with source SHA")
+    target_commit = release.get("target_commit")
+    if target_commit is not None and target_commit != source_sha:
+        fail("release target commit conflicts with source SHA")
     release_id = release.get("id")
     if not isinstance(release_id, int) or isinstance(release_id, bool):
         fail("release response omitted its numeric id")
     return release_id
 
 
-def validate_assets(release: dict[str, Any], expected_names: set[str]) -> dict[str, dict[str, Any]]:
-    assets = release.get("assets")
-    if not isinstance(assets, list):
+def validate_assets(
+    release: dict[str, Any], *, allow_partial: bool = False
+) -> dict[str, dict[str, Any]]:
+    raw_assets = release.get("assets")
+    if not isinstance(raw_assets, list):
         fail("release response has no asset list")
     by_name: dict[str, dict[str, Any]] = {}
-    for asset in assets:
+    for asset in raw_assets:
         if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
             fail("release contains a malformed asset")
         name = asset["name"]
         if name in by_name:
             fail("release contains duplicate asset names")
         by_name[name] = asset
-    if set(by_name) != expected_names:
-        fail("release assets do not exactly match the release.flag contract")
+    names = set(by_name)
+    if allow_partial:
+        if not names.issubset(ASSET_NAMES):
+            fail("release contains assets outside the immutable Keyman contract")
+    elif names != ASSET_NAMES:
+        fail("release assets do not exactly match the Keyman contract")
     return by_name
 
 
-def download_asset(asset: dict[str, Any], token: str) -> bytes:
-    download_url = asset.get("browser_download_url")
-    if not isinstance(download_url, str):
-        fail("release.flag asset response omitted its browser download URL")
-    status, raw = request(
-        "GET",
-        download_url,
-        token,
-        accept="application/octet-stream",
+def expected_asset_url(asset: dict[str, Any], source_sha: str) -> str:
+    name = asset.get("name")
+    value = asset.get("browser_download_url")
+    if not isinstance(name, str) or name not in ASSET_NAMES or not isinstance(value, str):
+        fail("release asset response omitted a valid name or download URL")
+    tag = release_tag(source_sha)
+    expected_path = (
+        DOWNLOAD_PREFIX
+        + urllib.parse.quote(tag, safe="")
+        + "/"
+        + urllib.parse.quote(name, safe="")
     )
-    if status != 200:
-        fail(f"release.flag download returned HTTP {status}")
-    return raw
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "git.home.arpa"
+        or parsed.netloc != "git.home.arpa"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.path != expected_path
+    ):
+        fail("asset download URL does not match the fixed Forgejo tag and asset path")
+    return value
 
 
-def validate_existing(release: dict[str, Any], source_sha: str, token: str, expected: bytes) -> None:
-    validate_identity(release, source_sha)
-    assets = validate_assets(release, {FLAG_NAME})
-    if download_asset(assets[FLAG_NAME], token) != expected:
-        fail("immutable release.flag conflict; refusing overwrite")
+def download_asset(asset: dict[str, Any], source_sha: str, token: str) -> bytes:
+    return request_bytes(expected_asset_url(asset, source_sha), token)
 
 
-def multipart_flag(content: bytes) -> tuple[bytes, str]:
+def _json_type_matches(value: Any, type_name: str) -> bool:
+    if type_name == "null":
+        return value is None
+    if type_name == "object":
+        return isinstance(value, dict)
+    if type_name == "array":
+        return isinstance(value, list)
+    if type_name == "string":
+        return isinstance(value, str)
+    if type_name == "boolean":
+        return isinstance(value, bool)
+    if type_name == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if type_name == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return False
+
+
+def load_release_flag_seat(token: str) -> dict[str, Any]:
+    raw = request_bytes(RELEASE_FLAG_SEAT_URL, token)
+    try:
+        seat = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("release flag schema seat is not valid JSON") from exc
+    if not isinstance(seat, dict) or seat.get("schema") != RELEASE_FLAG_SCHEMA:
+        fail("release flag schema seat has a foreign schema")
+    required = seat.get("required")
+    fields = seat.get("fields")
+    if (
+        not isinstance(required, list)
+        or not required
+        or any(not isinstance(field, str) or not field for field in required)
+        or not isinstance(fields, dict)
+    ):
+        fail("release flag schema seat has invalid required fields or field declarations")
+    return seat
+
+
+def validate_release_flag(
+    flag: Any,
+    seat: dict[str, Any],
+    source_sha: str,
+    binary_digest: str,
+) -> dict[str, Any]:
+    if not isinstance(flag, dict) or flag.get("schema") != RELEASE_FLAG_SCHEMA:
+        fail("release.flag has a foreign schema or is not an object")
+    required = seat["required"]
+    fields = seat["fields"]
+    for field in required:
+        if field not in flag or flag[field] is None or flag[field] == "":
+            fail(f"release.flag required field {field} is absent or empty")
+    for field, value in flag.items():
+        rule = fields.get(field)
+        if not isinstance(rule, dict):
+            continue
+        declared_type = rule.get("type")
+        if declared_type is not None:
+            allowed_types = declared_type if isinstance(declared_type, list) else [declared_type]
+            if not isinstance(allowed_types, list) or not any(
+                isinstance(item, str) and _json_type_matches(value, item)
+                for item in allowed_types
+            ):
+                fail(f"release.flag field {field} has the wrong schema type")
+        if "const" in rule and value != rule["const"]:
+            fail(f"release.flag field {field} conflicts with its schema constant")
+        enum = rule.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            fail(f"release.flag field {field} is outside its schema enum")
+        pattern = rule.get("pattern")
+        if pattern is not None:
+            if not isinstance(pattern, str):
+                fail(f"release flag schema pattern for {field} is invalid")
+            try:
+                if not isinstance(value, str) or re.search(pattern, value) is None:
+                    fail(f"release.flag field {field} does not match its schema pattern")
+            except re.error as exc:
+                raise ReleaseError(f"release flag schema pattern for {field} is invalid") from exc
+    if flag.get("component") != "keyman":
+        fail("release.flag component conflicts with keyman")
+    if flag.get("source_sha") != source_sha:
+        fail("release.flag source SHA conflicts with its release tag")
+    if flag.get("sha256") != binary_digest or not DIGEST.fullmatch(str(flag.get("sha256", ""))):
+        fail("release.flag binary digest conflicts with the published binary")
+    if not isinstance(flag.get("flagged_at"), str) or not isinstance(flag.get("pipeline_url"), str):
+        fail("release.flag timestamp or pipeline URL is invalid")
+    return flag
+
+
+def canonical_release_flag(
+    source_sha: str,
+    binary_digest: str,
+    pipeline_url: str,
+    seat: dict[str, Any],
+) -> bytes:
+    if not pipeline_url:
+        fail("CI_PIPELINE_URL is required")
+    flag = {
+        "schema": RELEASE_FLAG_SCHEMA,
+        "component": "keyman",
+        "source_sha": source_sha,
+        "sha256": binary_digest,
+        "flagged_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "pipeline_url": pipeline_url,
+    }
+    validate_release_flag(flag, seat, source_sha, binary_digest)
+    return (json.dumps(flag, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def validate_existing_asset(
+    name: str,
+    asset: dict[str, Any],
+    source_sha: str,
+    token: str,
+    seat: dict[str, Any],
+    binary: bytes,
+    sidecar: bytes,
+    binary_digest: str,
+) -> None:
+    downloaded = download_asset(asset, source_sha, token)
+    if name == BINARY_NAME:
+        if downloaded != binary:
+            fail("immutable release binary conflict; refusing overwrite")
+        return
+    if name == SIDECAR_NAME:
+        if downloaded != sidecar:
+            fail("immutable release checksum conflict; refusing overwrite")
+        return
+    try:
+        flag = json.loads(downloaded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("existing release.flag is not valid JSON") from exc
+    validate_release_flag(flag, seat, source_sha, binary_digest)
+
+
+def _multipart_asset(content: bytes, name: str, content_type: str) -> tuple[bytes, str]:
     boundary = "keyman-release-" + secrets.token_hex(16)
     header = (
         f'--{boundary}\r\nContent-Disposition: form-data; name="attachment"; '
-        f'filename="{FLAG_NAME}"\r\nContent-Type: application/json; charset=utf-8\r\n\r\n'
+        f'filename="{name}"\r\nContent-Type: {content_type}\r\n\r\n'
     ).encode("ascii")
     trailer = f"\r\n--{boundary}--\r\n".encode("ascii")
     return header + content + trailer, f"multipart/form-data; boundary={boundary}"
@@ -245,7 +439,7 @@ def create_release(source_sha: str, token: str) -> tuple[dict[str, Any], bool]:
     ).encode("utf-8")
     status, raw = request(
         "POST",
-        f"/repos/{OWNER_REPO}/releases",
+        _repo_path() + "/releases",
         token,
         body=payload,
         content_type="application/json",
@@ -254,53 +448,145 @@ def create_release(source_sha: str, token: str) -> tuple[dict[str, Any], bool]:
         raced = read_release(source_sha, token)
         if raced is None:
             fail("release create race did not produce a readable release")
-        return raced, True
+        return raced, False
     if status != 201:
         fail(f"release creation returned HTTP {status}")
-    value = decode_json(raw, "release creation")
-    if not isinstance(value, dict):
+    try:
+        release = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("release creation returned invalid JSON") from exc
+    if not isinstance(release, dict):
         fail("release creation returned a non-object")
-    validate_identity(value, source_sha)
-    validate_assets(value, set())
-    return value, False
+    validate_release_identity(release, source_sha)
+    validate_assets(release, allow_partial=True)
+    return release, True
 
 
-def publish(source_sha: str, token: str, expected: bytes) -> tuple[str, str]:
-    existing = read_release(source_sha, token)
-    if existing is not None:
-        validate_existing(existing, source_sha, token, expected)
-        return "no-op", release_page_url(source_sha)
+def _verify_present_assets(
+    assets: dict[str, dict[str, Any]],
+    source_sha: str,
+    token: str,
+    seat: dict[str, Any],
+    binary: bytes,
+    sidecar: bytes,
+    binary_digest: str,
+) -> None:
+    for name, asset in assets.items():
+        validate_existing_asset(
+            name,
+            asset,
+            source_sha,
+            token,
+            seat,
+            binary,
+            sidecar,
+            binary_digest,
+        )
 
-    release, raced = create_release(source_sha, token)
-    if raced:
-        validate_existing(release, source_sha, token, expected)
-        return "no-op", release_page_url(source_sha)
-    release_id = validate_identity(release, source_sha)
-    if release.get("assets") != []:
-        validate_assets(release, set())
 
-    body, content_type = multipart_flag(expected)
+def upload_missing_asset(
+    release: dict[str, Any],
+    name: str,
+    content: bytes,
+    content_type: str,
+    source_sha: str,
+    token: str,
+    seat: dict[str, Any],
+    binary: bytes,
+    sidecar: bytes,
+    binary_digest: str,
+) -> dict[str, Any]:
+    release_id = validate_release_identity(release, source_sha)
+    body, multipart_type = _multipart_asset(content, name, content_type)
     status, _ = request(
         "POST",
-        f"/repos/{OWNER_REPO}/releases/{release_id}/assets?"
-        + urllib.parse.urlencode({"name": FLAG_NAME}),
+        f"{_repo_path()}/releases/{release_id}/assets?"
+        + urllib.parse.urlencode({"name": name}),
         token,
         body=body,
-        content_type=content_type,
+        content_type=multipart_type,
     )
-    if status != 201:
-        fail(f"release.flag upload returned HTTP {status}")
+    # A lost response or concurrent uploader is safe only if the exact asset
+    # can be read back and verified; this lane never replaces an existing one.
+    reread = read_release_id(release_id, token)
+    validate_release_identity(reread, source_sha)
+    assets = validate_assets(reread, allow_partial=True)
+    if name not in assets:
+        fail(f"{name} upload returned HTTP {status} and the asset is absent")
+    validate_existing_asset(
+        name,
+        assets[name],
+        source_sha,
+        token,
+        seat,
+        binary,
+        sidecar,
+        binary_digest,
+    )
+    return reread
 
-    reread = read_release(source_sha, token)
-    if reread is None:
-        fail("release reread returned HTTP 404")
-    validate_existing(reread, source_sha, token, expected)
-    return "published", release_page_url(source_sha)
 
+def publish_release(
+    source_sha: str,
+    token: str,
+    seat: dict[str, Any],
+    binary: bytes,
+    sidecar: bytes,
+    flag_bytes: bytes,
+    binary_digest: str,
+) -> tuple[str, dict[str, Any], str]:
+    release = read_release(source_sha, token)
+    created = False
+    changed = False
+    if release is None:
+        release, created = create_release(source_sha, token)
+        changed = created
 
-def _repo_path() -> str:
-    return "/repos/" + "/".join(
-        urllib.parse.quote(part, safe="") for part in OWNER_REPO.split("/")
+    release_id = validate_release_identity(release, source_sha)
+    assets = validate_assets(release, allow_partial=True)
+    _verify_present_assets(
+        assets, source_sha, token, seat, binary, sidecar, binary_digest
+    )
+
+    # Historical flag-only releases are immutable. Do not retrofit binary
+    # assets into one; an interrupted new upload can resume only after at least
+    # one matching binary/checksum asset proves the new contract was started.
+    if FLAG_NAME in assets and not {BINARY_NAME, SIDECAR_NAME}.issubset(assets):
+        fail("immutable flag-only release conflict; refusing to modify historical release")
+    if not created and not assets:
+        fail("existing empty release conflict; refusing to modify it")
+
+    upload_order = (
+        (BINARY_NAME, binary, "application/octet-stream"),
+        (SIDECAR_NAME, sidecar, "text/plain"),
+        (FLAG_NAME, flag_bytes, "application/json"),
+    )
+    for name, content, content_type in upload_order:
+        if name in assets:
+            continue
+        release = upload_missing_asset(
+            release,
+            name,
+            content,
+            content_type,
+            source_sha,
+            token,
+            seat,
+            binary,
+            sidecar,
+            binary_digest,
+        )
+        assets = validate_assets(release, allow_partial=True)
+        changed = True
+
+    final_release = read_release_id(release_id, token)
+    validate_release_identity(final_release, source_sha)
+    final_assets = validate_assets(final_release)
+    _verify_present_assets(
+        final_assets, source_sha, token, seat, binary, sidecar, binary_digest
+    )
+    return ("published" if changed else "no-op"), final_release, release_page_url(
+        final_release, source_sha
     )
 
 
@@ -311,38 +597,47 @@ def list_releases(token: str) -> list[dict[str, Any]]:
     seen_ids: set[int] = set()
     page = 1
     while True:
-        query = urllib.parse.urlencode({"page": page, "limit": RELEASE_PAGE_LIMIT})
-        status, raw = request("GET", f"{base}?{query}", token)
-        if status != 200:
-            fail(f"release listing page {page} returned HTTP {status}")
-        values = decode_json(raw, f"release listing page {page}")
-        if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+        path = base + "?" + urllib.parse.urlencode(
+            {"page": page, "limit": RELEASE_PAGE_LIMIT}
+        )
+        batch = request_json("GET", path, token)
+        if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
             fail(f"release listing page {page} returned a malformed list")
-        if len(values) < RELEASE_PAGE_LIMIT:
-            releases.extend(values)
+        if len(batch) < RELEASE_PAGE_LIMIT:
+            releases.extend(batch)
             return releases
-        fingerprint = json.dumps(values, sort_keys=True, separators=(",", ":"))
+        fingerprint = json.dumps(batch, sort_keys=True, separators=(",", ":"))
         if fingerprint in seen_pages:
             fail(f"release listing page {page} repeated a previous full page")
         seen_pages.add(fingerprint)
         page_ids = {
-            item["id"] for item in values
+            item["id"]
+            for item in batch
             if isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool)
         }
         if page_ids and page_ids.issubset(seen_ids):
             fail(f"release listing page {page} made no progress")
         seen_ids.update(page_ids)
-        releases.extend(values)
+        releases.extend(batch)
         page += 1
 
 
-def _eligible_release(release: dict[str, Any]) -> tuple[datetime.datetime, int] | None:
+def eligible_release_order(
+    release: dict[str, Any],
+) -> tuple[datetime.datetime, int] | None:
     tag = release.get("tag_name")
     target = release.get("target_commitish")
-    if release.get("draft") is not False or not isinstance(tag, str):
+    if (
+        release.get("draft") is not False
+        or release.get("prerelease") is True
+        or not isinstance(tag, str)
+    ):
         return None
     match = RELEASE_TAG.fullmatch(tag)
     if match is None or target != match.group(1):
+        return None
+    target_commit = release.get("target_commit")
+    if target_commit is not None and target_commit != match.group(1):
         return None
     release_id = release.get("id")
     if not isinstance(release_id, int) or isinstance(release_id, bool):
@@ -352,88 +647,62 @@ def _eligible_release(release: dict[str, Any]) -> tuple[datetime.datetime, int] 
         fail(f"eligible release {release_id} omitted created_at")
     try:
         created_at = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
-    except ValueError:
-        fail(f"eligible release {release_id} has invalid created_at")
+    except ValueError as exc:
+        raise ReleaseError(f"eligible release {release_id} has invalid created_at") from exc
     if created_at.tzinfo is None:
         fail(f"eligible release {release_id} has timezone-free created_at")
     return created_at.astimezone(datetime.timezone.utc), release_id
 
 
-def _release_order(release: dict[str, Any]) -> tuple[datetime.datetime, int]:
-    order = _eligible_release(release)
-    if order is None:
-        fail("internal retention ordering error")
-    return order
-
-
-def _verify_tag_absent(tag: str, token: str) -> bool:
-    path = _repo_path() + "/git/refs/tags/" + urllib.parse.quote(tag, safe="")
-    status, _ = request("GET", path, token)
-    if status == 404:
-        return True
-    if status == 200:
-        return False
-    fail(f"tag ref {tag} cannot be verified: GET returned HTTP {status}")
-
-
-def retention_plan(
-    token: str, protected_id: int | None = None, *, protected_tag: str | None = None
-) -> dict[str, Any]:
-    eligible = [item for item in list_releases(token) if _eligible_release(item) is not None]
-    if protected_tag is not None:
-        matching = [item for item in eligible if item.get("tag_name") == protected_tag]
-        if matching:
-            protected_id = matching[0]["id"]
-    eligible.sort(key=_release_order, reverse=True)
-    kept = eligible[:RELEASE_RETENTION]
-    protected = next((item for item in eligible if item.get("id") == protected_id), None)
-    retained = kept + ([protected] if protected is not None and protected not in kept else [])
-    overflow = [item for item in eligible[RELEASE_RETENTION:] if item.get("id") != protected_id]
-    return {
-        "eligible_count": len(eligible),
-        "boundary": {
-            "retention": RELEASE_RETENTION,
-            "rank_20_id": kept[-1].get("id") if len(kept) == RELEASE_RETENTION else None,
-            "rank_21_id": eligible[RELEASE_RETENTION].get("id") if len(eligible) > RELEASE_RETENTION else None,
-        },
-        "kept_ids": [item["id"] for item in retained],
-        "protected_id": protected_id,
-        "delete_candidates": overflow,
-    }
-
-
-def apply_retention(token: str, protected_id: int) -> dict[str, Any]:
-    plan = retention_plan(token, protected_id)
+def apply_retention(token: str, protected_release_id: int) -> dict[str, Any]:
     deleted_ids: list[int] = []
     deleted_tags: list[str] = []
     remaining_tag_refs: list[str] = []
-    base = _repo_path()
+    plan: dict[str, Any] = {"kept_ids": [], "delete_candidates": []}
+    phase = "list"
     attempted_id: int | None = None
     attempted_tag: str | None = None
-    phase = "start"
 
     def receipt() -> dict[str, Any]:
         return {
-            "mode": "partial",
-            "kept_count": len(plan["kept_ids"]),
+            "retained_ids": plan["kept_ids"],
             "deleted_ids": deleted_ids,
             "deleted_tags": deleted_tags,
             "remaining_tag_refs": remaining_tag_refs,
             "attempted": {"id": attempted_id, "tag": attempted_tag, "phase": phase},
-            "boundary": plan["boundary"],
         }
 
     try:
+        ordered: list[tuple[tuple[datetime.datetime, int], dict[str, Any]]] = []
+        for item in list_releases(token):
+            order = eligible_release_order(item)
+            if order is not None:
+                ordered.append((order, item))
+        ordered.sort(key=lambda entry: entry[0], reverse=True)
+        eligible = [item for _, item in ordered]
+        if not any(item.get("id") == protected_release_id for item in eligible):
+            fail("published release is absent from the eligible retention set")
+        retained = eligible[:RETENTION_COUNT]
+        if all(item.get("id") != protected_release_id for item in retained):
+            protected = next(
+                item for item in eligible if item.get("id") == protected_release_id
+            )
+            retained.append(protected)
+        retained_ids = {item["id"] for item in retained}
+        plan["kept_ids"] = [item["id"] for item in retained]
+        plan["delete_candidates"] = [
+            item for item in eligible if item.get("id") not in retained_ids
+        ]
+
+        base = _repo_path()
         for release in plan["delete_candidates"]:
             release_id = release["id"]
             tag = release["tag_name"]
-            attempted_id = release_id
-            attempted_tag = tag
+            attempted_id, attempted_tag = release_id, tag
             phase = "release_delete"
             status, _ = request("DELETE", f"{base}/releases/{release_id}", token)
             if status not in (200, 204):
                 fail(f"release deletion for id {release_id} returned HTTP {status}")
-
             phase = "release_verify"
             status, _ = request("GET", f"{base}/releases/{release_id}", token)
             if status != 404:
@@ -441,84 +710,117 @@ def apply_retention(token: str, protected_id: int) -> dict[str, Any]:
             deleted_ids.append(release_id)
 
             phase = "tag_delete"
-            status, _ = request(
-                "DELETE", f"{base}/tags/{urllib.parse.quote(tag, safe='')}", token
-            )
-            if status not in (204, 404):
+            tag_path = base + "/tags/" + urllib.parse.quote(tag, safe="")
+            status, _ = request("DELETE", tag_path, token)
+            if status not in (200, 204, 404):
                 fail(f"tag deletion for {tag} returned HTTP {status}")
-
             phase = "tag_verify"
-            if _verify_tag_absent(tag, token):
+            ref_path = base + "/git/refs/tags/" + urllib.parse.quote(tag, safe="")
+            status, _ = request("GET", ref_path, token)
+            if status == 404:
                 deleted_tags.append(tag)
-            else:
+            elif status == 200:
                 remaining_tag_refs.append(tag)
+            else:
+                fail(f"tag ref {tag} verification returned HTTP {status}")
+
+        phase = "release_readback"
+        final_releases = list_releases(token)
+        final_eligible = [
+            item
+            for item in final_releases
+            if eligible_release_order(item) is not None
+        ]
+        surviving_tags = sorted(item["tag_name"] for item in final_eligible)
+        if remaining_tag_refs:
+            raise RetentionFailure(
+                "one or more pruned Git tag refs remain",
+                {
+                    **receipt(),
+                    "surviving_tags": surviving_tags,
+                },
+            )
+        return {
+            "retained_count": len(retained),
+            "retained_tags": [item["tag_name"] for item in retained],
+            "surviving_tags": surviving_tags,
+            "deleted_ids": deleted_ids,
+            "deleted_tags": deleted_tags,
+        }
+    except RetentionFailure:
+        raise
     except ReleaseError as exc:
         raise RetentionFailure(str(exc), receipt()) from exc
 
-    return {
-        "mode": "applied",
-        "kept_count": len(plan["kept_ids"]),
-        "kept_ids": plan["kept_ids"],
-        "deleted_ids": deleted_ids,
-        "deleted_tags": deleted_tags,
-        "remaining_tag_refs": remaining_tag_refs,
-        "boundary": plan["boundary"],
-    }
-
-
-def dry_run_retention(token: str, protected_tag: str | None = None) -> dict[str, Any]:
-    plan = retention_plan(token, protected_tag=protected_tag)
-    return {
-        "mode": "dry-run",
-        "kept_count": len(plan["kept_ids"]),
-        "kept_ids": plan["kept_ids"],
-        "would_delete_ids": [item["id"] for item in plan["delete_candidates"]],
-        "would_delete_tags": [item["tag_name"] for item in plan["delete_candidates"]],
-        "boundary": plan["boundary"],
-    }
-
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Publish keyman release.flag and retain newest releases")
-    parser.add_argument("--dry-run", action="store_true", help="GET-only retention plan (no publishing or deletion)")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--binary", required=True)
+    parser.add_argument("--sidecar", required=True)
+    parser.add_argument("--pipeline-url", required=True)
     args = parser.parse_args()
+
     token = os.environ.get("FORGEJO_TOKEN", "").strip()
     if not token:
         print(json.dumps({"status": "error", "error": "FORGEJO_TOKEN is required"}, separators=(",", ":")))
         return 1
+
     try:
-        if args.dry_run:
-            protected_tag = None
-            source_sha = os.environ.get("CI_COMMIT_SHA", "")
-            if FULL_SHA.fullmatch(source_sha):
-                protected_tag = release_tag(source_sha)
-            result = dry_run_retention(token, protected_tag)
-            print(json.dumps({"status": "ok", "repo": OWNER_REPO, "retention": result}, separators=(",", ":")))
-            return 0
-        source_sha = os.environ.get("CI_COMMIT_SHA", "")
-        expected = flag_bytes(source_sha, os.environ.get("CI_PIPELINE_URL", ""))
-        status, url = publish(source_sha, token, expected)
-        retention = None
-        if os.environ.get("CI_COMMIT_BRANCH") == "main":
-            release = read_release(source_sha, token)
-            if release is None:
-                fail("published release disappeared before retention")
-            protected_id = validate_identity(release, source_sha)
-            validate_existing(release, source_sha, token, expected)
-            retention = apply_retention(token, protected_id)
-    except ReleaseError as exc:
-        error: dict[str, Any] = {"status": "error", "error": str(exc)}
-        if isinstance(exc, RetentionFailure):
-            error["retention"] = exc.receipt
-        print(json.dumps(error, separators=(",", ":")))
+        source_sha = args.source_sha
+        release_tag(source_sha)
+        if not args.pipeline_url:
+            fail("CI_PIPELINE_URL is required")
+        if Path(args.binary).name != BINARY_NAME or Path(args.sidecar).name != SIDECAR_NAME:
+            fail("binary and sidecar names do not match the Keyman release contract")
+        binary_path = Path(args.binary)
+        sidecar_path = Path(args.sidecar)
+        if not binary_path.is_file() or not sidecar_path.is_file():
+            fail("binary or checksum sidecar does not exist")
+        binary = binary_path.read_bytes()
+        if not binary:
+            fail("Rust binary is empty")
+        binary_digest = hashlib.sha256(binary).hexdigest()
+        expected_sidecar = f"{binary_digest}  {BINARY_NAME}\n".encode("ascii")
+        sidecar = sidecar_path.read_bytes()
+        if sidecar != expected_sidecar:
+            fail("checksum sidecar is not the exact sha256 record for the binary")
+
+        seat = load_release_flag_seat(token)
+        flag_bytes = canonical_release_flag(
+            source_sha, binary_digest, args.pipeline_url, seat
+        )
+        status, release, url = publish_release(
+            source_sha,
+            token,
+            seat,
+            binary,
+            sidecar,
+            flag_bytes,
+            binary_digest,
+        )
+        release_id = validate_release_identity(release, source_sha)
+        retention = apply_retention(token, release_id)
+    except RetentionFailure as exc:
+        print(
+            json.dumps(
+                {"status": "error", "error": str(exc), "retention": exc.receipt},
+                separators=(",", ":"),
+            )
+        )
         return 1
+    except ReleaseError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
+        return 1
+
     print(
         json.dumps(
             {
                 "status": status,
-                "tag": release_tag(source_sha),
-                "name": f"keyman {source_sha[:8]}",
-                "assets": [FLAG_NAME],
+                "tag": release_tag(args.source_sha),
+                "commit": args.source_sha,
+                "assets": [BINARY_NAME, SIDECAR_NAME, FLAG_NAME],
+                "sha256": binary_digest,
                 "release_url": url,
                 "retention": retention,
             },

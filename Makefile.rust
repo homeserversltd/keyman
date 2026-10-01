@@ -1,0 +1,17 @@
+RUST_CARGO ?= cargo
+RUST_MANIFEST := rust/Cargo.toml
+RUST_TARGET_DIR := rust/target
+RUST_BINARY := $(RUST_TARGET_DIR)/release/keyman
+DIST_BINARY := dist/keyman-x86_64
+
+.PHONY: all build clean
+
+all: build
+
+build:
+	$(RUST_CARGO) build --release --manifest-path $(RUST_MANIFEST) --target-dir $(RUST_TARGET_DIR)
+	mkdir -p dist
+	install -m 0755 $(RUST_BINARY) $(DIST_BINARY)
+
+clean:
+	rm -rf $(RUST_TARGET_DIR) $(DIST_BINARY)

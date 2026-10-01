@@ -4,24 +4,48 @@ when:
 
 steps:
   - name: release-publish
-    image: python:3.12-alpine
+    image: git.home.arpa/homeserversltd/rust-house:house
     environment:
       FORGEJO_TOKEN:
         from_secret: FORGEJO_TOKEN
     commands:
       - |
         set -eu
+        : "$${CI_COMMIT_SHA:?CI_COMMIT_SHA is required}"
+        : "$${CI_PIPELINE_URL:?CI_PIPELINE_URL is required}"
         python3 - <<'PY'
         import urllib.request
 
-        with urllib.request.urlopen("http://192.168.123.1:7100/v1/trust/ca-bundle") as response:
+        request = urllib.request.Request(
+            "http://192.168.123.1:7100/v1/trust/ca-bundle", method="GET"
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
             ca_bundle = response.read()
+            if response.status < 200 or response.status >= 300 or not ca_bundle:
+                raise SystemExit("release-publish: CA bundle response was empty or unsuccessful")
         with open("/tmp/house-ca.pem", "wb") as bundle_file:
             bundle_file.write(ca_bundle)
         PY
         test -s /tmp/house-ca.pem
         export SSL_CERT_FILE=/tmp/house-ca.pem
-        python3 ci/release_publish.py
+        make -f Makefile.rust
+        python3 - <<'PY'
+        import hashlib
+        from pathlib import Path
+
+        binary = Path("dist/keyman-x86_64")
+        if not binary.is_file() or not binary.stat().st_size:
+            raise SystemExit("release-publish: Rust build did not produce dist/keyman-x86_64")
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        Path("dist/keyman-x86_64.sha256").write_bytes(
+            f"{digest}  keyman-x86_64\n".encode("ascii")
+        )
+        PY
+        python3 ci/release_publish.py \
+          --source-sha "$${CI_COMMIT_SHA}" \
+          --binary dist/keyman-x86_64 \
+          --sidecar dist/keyman-x86_64.sha256 \
+          --pipeline-url "$${CI_PIPELINE_URL}"
   - name: ci-outcome-keyman
     image: python:3.12-alpine
     backend_options:
