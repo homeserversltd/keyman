@@ -808,7 +808,7 @@ def delete_release_assets(release_id: int, release: dict[str, Any], token: str) 
     for name, asset in sorted(assets.items()):
         status, _ = request(
             "DELETE",
-            github_api_path(f"releases/{release_id}/assets/{asset['id']}"),
+            github_api_path(f"releases/assets/{asset['id']}"),
             token,
             service="github",
         )
