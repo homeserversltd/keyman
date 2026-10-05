@@ -83,7 +83,13 @@ class FixedHostRedirects(urllib.request.HTTPRedirectHandler):
 class ReleaseAssetRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _validate_url(newurl, GITHUB_DOWNLOAD_REDIRECT_HOSTS)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            for request_headers in (redirected.headers, redirected.unredirected_hdrs):
+                for name in tuple(request_headers):
+                    if name.casefold() == "authorization":
+                        del request_headers[name]
+        return redirected
 
 
 def tls_context() -> ssl.SSLContext:
@@ -127,6 +133,8 @@ def request(
         base = ""
         hosts = GITHUB_DOWNLOAD_HOSTS
         headers = {"Accept": accept, "User-Agent": "keyman-github-latest-mirror"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     elif service == "github-uploads":
         base = GITHUB_UPLOADS
         hosts = GITHUB_UPLOAD_HOSTS
@@ -555,7 +563,7 @@ def github_asset_map(release: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def download_github_asset(asset: dict[str, Any]) -> bytes:
+def download_github_asset(asset: dict[str, Any], token: str) -> bytes:
     name = checked_asset_name(asset.get("name"))
     url = asset.get("browser_download_url")
     if not isinstance(url, str):
@@ -579,7 +587,7 @@ def download_github_asset(asset: dict[str, Any]) -> bytes:
     ):
         fail(f"GitHub asset {name} download URL is outside the exact latest release asset")
     status, raw = request(
-        "GET", url, "", service="github-download", accept="application/octet-stream"
+        "GET", url, token, service="github-download", accept="application/octet-stream"
     )
     if status != 200:
         fail(f"GitHub asset {name} download returned HTTP {status}")
@@ -590,7 +598,7 @@ def download_github_asset(asset: dict[str, Any]) -> bytes:
 
 
 def github_assets_match(
-    release: dict[str, Any] | None, expected: dict[str, bytes]
+    release: dict[str, Any] | None, expected: dict[str, bytes], token: str
 ) -> tuple[bool, list[str], dict[str, bytes]]:
     if release is None:
         return False, [], {}
@@ -601,15 +609,15 @@ def github_assets_match(
         differences.extend(sorted((set(current) - expected_names) | (expected_names - set(current))))
     actual_payloads: dict[str, bytes] = {}
     for name in sorted(current):
-        actual_payloads[name] = download_github_asset(current[name])
+        actual_payloads[name] = download_github_asset(current[name], token)
         if name in expected and actual_payloads[name] != expected[name]:
             differences.append(name)
     return not differences, sorted(set(differences)), actual_payloads
 
 
-def read_github_main_sha() -> str:
+def read_github_main_sha(token: str) -> str:
     status, raw = request(
-        "GET", github_api_path("git/ref/heads/main"), "", service="github"
+        "GET", github_api_path("git/ref/heads/main"), token, service="github"
     )
     if status != 200:
         fail(f"GitHub main ref lookup returned HTTP {status}")
@@ -627,9 +635,9 @@ def read_github_main_sha() -> str:
     return obj["sha"]
 
 
-def read_github_ref() -> dict[str, Any] | None:
+def read_github_ref(token: str) -> dict[str, Any] | None:
     path = github_api_path("git/ref/tags/latest")
-    status, raw = request("GET", path, "", service="github")
+    status, raw = request("GET", path, token, service="github")
     if status == 404:
         return None
     if status != 200:
@@ -645,7 +653,7 @@ def read_github_ref() -> dict[str, Any] | None:
     return ref
 
 
-def resolve_github_tag_commit(ref: dict[str, Any] | None) -> str | None:
+def resolve_github_tag_commit(ref: dict[str, Any] | None, token: str) -> str | None:
     if ref is None:
         return None
     obj = ref["object"]
@@ -658,7 +666,7 @@ def resolve_github_tag_commit(ref: dict[str, Any] | None) -> str | None:
         seen.add(sha)
         if kind == "commit":
             return sha
-        status, raw = request("GET", github_api_path(f"git/tags/{sha}"), "", service="github")
+        status, raw = request("GET", github_api_path(f"git/tags/{sha}"), token, service="github")
         if status != 200:
             fail(f"GitHub annotated latest tag lookup returned HTTP {status}")
         tag_object = decode_json(raw, "GitHub annotated latest tag lookup")
@@ -680,10 +688,12 @@ def github_ref_points_to_sha(ref: dict[str, Any] | None, source_sha: str) -> boo
     )
 
 
-def wait_for_github_mirror(source_sha: str) -> tuple[str, dict[str, Any] | None]:
+def wait_for_github_mirror(
+    source_sha: str, token: str
+) -> tuple[str, dict[str, Any] | None]:
     for attempt in range(37):
-        main_sha = read_github_main_sha()
-        ref = read_github_ref()
+        main_sha = read_github_main_sha(token)
+        ref = read_github_ref(token)
         if main_sha == source_sha and github_ref_points_to_sha(ref, source_sha):
             return main_sha, ref
         if attempt < 36:
@@ -912,14 +922,14 @@ def upload_assets(release: dict[str, Any], expected: dict[str, bytes], token: st
             fail(f"GitHub asset upload for {name} returned the wrong asset")
         reread = read_github_release(release_id, token)
         asset = github_asset_map(reread).get(name)
-        if asset is None or download_github_asset(asset) != content:
+        if asset is None or download_github_asset(asset, token) != content:
             fail(f"GitHub asset upload for {name} was not verified")
 
 
 def verify_github_release(
     source_sha: str, expected: dict[str, bytes], token: str
 ) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, bytes]]:
-    main_sha, ref = wait_for_github_mirror(source_sha)
+    main_sha, ref = wait_for_github_mirror(source_sha, token)
     releases = list_github_releases(token)
     release = require_single_latest_release(releases)
     if release is None:
@@ -928,7 +938,7 @@ def verify_github_release(
         fail("GitHub latest release target does not match CI_COMMIT_SHA")
     if release.get("draft") is not False or release.get("prerelease") is not False:
         fail("GitHub latest release is not a public stable release")
-    matches, differences, actual_assets = github_assets_match(release, expected)
+    matches, differences, actual_assets = github_assets_match(release, expected, token)
     if not matches:
         fail("GitHub latest release assets differ from Forgejo: " + ", ".join(differences))
     if ref is None or not github_ref_points_to_sha(ref, source_sha):
@@ -951,6 +961,7 @@ def exact_state_noop(
     source_sha: str,
     expected: dict[str, bytes],
     forgejo_token: str,
+    github_token: str,
     latest: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     if (
@@ -964,13 +975,15 @@ def exact_state_noop(
     forgejo_ref = read_forgejo_ref(forgejo_token)
     if not forgejo_ref_points_to_sha(forgejo_ref, source_sha):
         return None
-    github_main = read_github_main_sha()
+    github_main = read_github_main_sha(github_token)
     if github_main != source_sha:
         return None
-    github_ref = read_github_ref()
+    github_ref = read_github_ref(github_token)
     if not github_ref_points_to_sha(github_ref, source_sha):
         return None
-    assets_match, _differences, actual_assets = github_assets_match(latest, expected)
+    assets_match, _differences, actual_assets = github_assets_match(
+        latest, expected, github_token
+    )
     if not assets_match:
         return None
     return {
@@ -1009,13 +1022,15 @@ def get_plan(
     forgejo_target = resolve_forgejo_tag_commit(forgejo_ref, forgejo_token)
     forgejo_main_sha = read_forgejo_main_sha(forgejo_token)
     forgejo_main_matches = forgejo_main_sha == source_sha
-    main_sha = read_github_main_sha()
-    github_ref = read_github_ref()
-    github_target = resolve_github_tag_commit(github_ref)
+    main_sha = read_github_main_sha(github_token)
+    github_ref = read_github_ref(github_token)
+    github_target = resolve_github_tag_commit(github_ref, github_token)
     releases = list_github_releases(github_token)
     latest_candidates = [item for item in releases if item.get("tag_name") == LATEST_TAG]
     latest = latest_candidates[0] if len(latest_candidates) == 1 else None
-    assets_match, differing_assets, actual_assets = github_assets_match(latest, expected)
+    assets_match, differing_assets, actual_assets = github_assets_match(
+        latest, expected, github_token
+    )
     conflicts = release_inventory_conflicts(releases)
     mirror_ready = main_sha == source_sha and github_ref_points_to_sha(github_ref, source_sha)
     if conflicts:
@@ -1136,13 +1151,15 @@ def publish(source_sha: str, expected: dict[str, bytes], forgejo_token: str, git
 
     # A conflicting release inventory blocks all writes, including the source-tag move.
     latest = require_single_latest_release(list_github_releases(github_token))
-    no_op = exact_state_noop(source_sha, expected, forgejo_token, latest)
+    no_op = exact_state_noop(
+        source_sha, expected, forgejo_token, github_token, latest
+    )
     if no_op is not None:
         return no_op
     forgejo_tag = ensure_forgejo_latest_tag(source_sha, forgejo_token)
     require_forgejo_main_is_source(source_sha, forgejo_token, "push_mirrors-sync")
     mirror_sync_http_status = sync_forgejo_push_mirrors(forgejo_token)
-    wait_for_github_mirror(source_sha)
+    wait_for_github_mirror(source_sha, github_token)
 
     latest = require_single_latest_release(list_github_releases(github_token))
     require_forgejo_main_is_source(source_sha, forgejo_token, "GitHub release write")
@@ -1153,7 +1170,9 @@ def publish(source_sha: str, expected: dict[str, bytes], forgejo_token: str, git
     if not isinstance(release_id, int) or isinstance(release_id, bool):
         fail("GitHub latest release omitted its numeric id")
 
-    matches, _differences, _actual = github_assets_match(latest, expected)
+    matches, _differences, _actual = github_assets_match(
+        latest, expected, github_token
+    )
     if not matches:
         delete_release_assets(release_id, latest, github_token)
         upload_assets(latest, expected, github_token)
