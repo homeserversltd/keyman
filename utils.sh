@@ -1,21 +1,55 @@
 #!/bin/bash
 
-#directory where the scripts are located
-readonly KEYMAN_DIR="/vault/keyman/"
-readonly KEY_DIR="/root/key"
-#this is the randomly generated password that ships with every device
-readonly SKELETON_KEY="/root/key/skeleton.key"
-readonly VAULT_DIR="/vault/.keys"
-readonly SERVICE_SUITE_KEY="$VAULT_DIR/service_suite.key"  # Renamed from admin.key
-readonly NAS_KEY="$VAULT_DIR/nas.key"  # NAS encryption key
-readonly TEMP_DIR="/mnt/keyexchange"
-readonly LOG_FILE="/mnt/ramdisk/logs/keymanagement.log"
-readonly TIMER_FILE="/mnt/ramdisk/keyman_timer.pid"
-readonly TIMER_TIMESTAMP="/mnt/ramdisk/keyman_timer.ts"
+# Directory roots. KEYMAN_ROOT is an explicit isolated runtime root for
+# scratch operation; an invalid value never falls back to the live vault.
+KEYMAN_ROOT_BASE=""
+if [ "${KEYMAN_ROOT+x}" = x ]; then
+    KEYMAN_ROOT_BASE="$KEYMAN_ROOT"
+    if [ -z "$KEYMAN_ROOT_BASE" ]; then
+        printf 'MGLA REFUSAL: unsafe-keyman-root\n' >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
+if [ "${KEYMAN_ROOT+x}" = x ]; then
+    if [[ "$KEYMAN_ROOT_BASE" != /* || "$KEYMAN_ROOT_BASE" = "/" || "$KEYMAN_ROOT_BASE" = */ || "/$KEYMAN_ROOT_BASE/" == *"/../"* || "/$KEYMAN_ROOT_BASE/" == *"/./"* ]]; then
+        printf 'MGLA REFUSAL: unsafe-keyman-root\n' >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    resolved_keyman_root=$(realpath -e -- "$KEYMAN_ROOT_BASE" 2>/dev/null) || {
+        printf 'MGLA REFUSAL: keyman-root-missing\n' >&2
+        return 1 2>/dev/null || exit 1
+    }
+    if [ "$resolved_keyman_root" != "$KEYMAN_ROOT_BASE" ] || [ ! -d "$resolved_keyman_root" ]; then
+        printf 'MGLA REFUSAL: unsafe-keyman-root\n' >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    KEYMAN_DIR="$KEYMAN_ROOT_BASE/vault/keyman/"
+    KEY_DIR="$KEYMAN_ROOT_BASE/root/key"
+    SKELETON_KEY="$KEY_DIR/skeleton.key"
+    VAULT_DIR="$KEYMAN_ROOT_BASE/vault/.keys"
+    TEMP_DIR="$KEYMAN_ROOT_BASE/mnt/keyexchange"
+    LOG_FILE="$KEYMAN_ROOT_BASE/mnt/ramdisk/logs/keymanagement.log"
+    TIMER_FILE="$KEYMAN_ROOT_BASE/mnt/ramdisk/keyman_timer.pid"
+    TIMER_TIMESTAMP="$KEYMAN_ROOT_BASE/mnt/ramdisk/keyman_timer.ts"
+    BENCHMARK_LOG="$KEYMAN_ROOT_BASE/mnt/ramdisk/logs/benchmark.log"
+else
+    KEYMAN_DIR="/vault/keyman/"
+    KEY_DIR="/root/key"
+    SKELETON_KEY="/root/key/skeleton.key"
+    VAULT_DIR="/vault/.keys"
+    TEMP_DIR="/mnt/keyexchange"
+    LOG_FILE="/mnt/ramdisk/logs/keymanagement.log"
+    TIMER_FILE="/mnt/ramdisk/keyman_timer.pid"
+    TIMER_TIMESTAMP="/mnt/ramdisk/keyman_timer.ts"
+    BENCHMARK_LOG="/mnt/ramdisk/logs/benchmark.log"
+fi
+readonly KEYMAN_DIR KEY_DIR SKELETON_KEY VAULT_DIR TEMP_DIR
+readonly LOG_FILE TIMER_FILE TIMER_TIMESTAMP BENCHMARK_LOG
+readonly SERVICE_SUITE_KEY="$VAULT_DIR/service_suite.key"
+readonly NAS_KEY="$VAULT_DIR/nas.key"
 readonly CLEANUP_DELAY=15  # Seconds before cleanup
 readonly DEBUG=${DEBUG:-false}  # Set to true to enable debug output
 readonly BENCHMARK=${BENCHMARK:-false}  # Set to true to enable timing
-readonly BENCHMARK_LOG="/mnt/ramdisk/logs/benchmark.log"
 readonly SYSTEM_AUTH_SERVICES=("ssh" "ttyd")  # Services that use system authentication
 
 # Define unambiguous character sets
@@ -187,6 +221,18 @@ get_service_suite_key() {
 
 #do not run this manually ; exportkey.sh handles this
 secure_cleanup() {
+    # Coordinate with the MGLA operation lock. A pending legacy cleanup must
+    # never wipe an in-flight scoped export or another service's exchange file.
+    local cleanup_lock_fd=""
+    if [ -f "$SKELETON_KEY" ]; then
+        exec {cleanup_lock_fd}<"$SKELETON_KEY" || return 1
+        if ! flock -n "$cleanup_lock_fd"; then
+            debug_log "Skipping shared exchange cleanup while MGLA holds Keyman custody"
+            exec {cleanup_lock_fd}<&-
+            return 0
+        fi
+    fi
+
     # Only proceed if the directory exists
     if [ -d "$TEMP_DIR" ]; then
         # Clean up files if any exist
@@ -206,10 +252,23 @@ secure_cleanup() {
         # Remove directory if it still exists
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
+    if [ -n "$cleanup_lock_fd" ]; then
+        flock -u "$cleanup_lock_fd" || true
+        exec {cleanup_lock_fd}<&-
+    fi
 }
 
 # Function to initialize ramdisk
 init_ramdisk() {
+    # The MGLA scoped ladder never mounts, unmounts, or globally cleans the
+    # exchange. It requires the caller-provided tmpfs and uses only owned files.
+    if [ "${KEYMAN_MGLA_SCOPED:-0}" = "1" ]; then
+        local exchange_type
+        exchange_type=$(findmnt -n -o FSTYPE --target "$TEMP_DIR" 2>/dev/null) || return 1
+        [ "$exchange_type" = "tmpfs" ] && [ -d "$TEMP_DIR" ] && [ -w "$TEMP_DIR" ] || return 1
+        return 0
+    fi
+
     # If ramdisk is already mounted and accessible, just use it
     if mountpoint -q "$TEMP_DIR" 2>/dev/null && [ -w "$TEMP_DIR" ]; then
         debug_log "Using existing RAM disk mount"

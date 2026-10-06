@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "name": "keyman-mgla",
+    "description": "Keyman-custodied Ed25519 MGLA key generation, public-key export, literal-body signing, and succession.",
+    "version": "1.0.0",
+    "schema_version": "1.0"
+  },
+  "execution": {
+    "entry_point": "index.py",
+    "language": "python"
+  },
+  "commands": {
+    "keygen": "keygen <service>",
+    "keyline": "keyline <service>",
+    "sign": "sign <service>",
+    "succeed": "succeed <old-service> <new-service>"
+  }
+}

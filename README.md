@@ -127,6 +127,42 @@ sudo /vault/keyman/exportkey.sh myapp_db
 - Passing the password as the third argument is **simple but not secret from the local shell**: it may appear in shell history and was visible in the process list while the command ran. For air-gapped or policy reasons, plan accordingly (the script does not read from stdin for the password).
 - **Admin / symlink keys:** Some flows use a symlink to `service_suite.key` instead of a dedicated `newkey` entry (see `newkey.sh` internal `adminkey` mode in other scripts). For a normal app credential, use `newkey.sh` as above.
 
+## MGLA estate-key verbs
+
+The released Rust `keyman` command dispatches the `mgla` family through the
+source-declared root Python front door (`index.py` → `lib.keyman_mgla`). The
+four operations are:
+
+```text
+keyman mgla keygen <service>
+keyman mgla keyline <service>
+keyman mgla sign <service>          # literal MGLA1 body on stdin
+keyman mgla succeed <old-service> <new-service>
+```
+
+`keygen` requires a TTY and refuses CI. It generates one 32-byte Ed25519 seed,
+then sends only `username=mgla` and the 64-character lowercase-hex seed over
+stdin to the internal exclusive `newkey.sh` path; it never puts the seed in
+arguments, environment, logs, or stdout. The encrypted service credential is
+created only if it does not already exist. The command prints the key id and
+`MGLA-KEY1` public line.
+
+`keyline`, `sign`, and `succeed` export only the requested credential(s) to
+the existing `/mnt/keyexchange` tmpfs. Scoped exports use unique mode-0600
+files, refuse pre-existing per-service exchange artifacts, skip the shared
+cleanup timer, serialize MGLA operations against the skeleton-key file lock,
+and securely remove only their own plaintext exports before printing success.
+A failed cleanup is a named non-zero refusal. `sign` validates the ordered
+white-paper MGLA1 grammar and signs the exact stdin bytes before `|sig=`; it
+does not trim or reserialize the body. `succeed` prints the MGLA-SUCC1 body
+signed by the old credential.
+
+For isolated scratch use, set `KEYMAN_ROOT` to an existing absolute canonical
+non-root directory whose `root/key`, `vault/.keys`, `vault/keyman`, and
+`mnt/keyexchange` paths contain the scratch hierarchy, runtime, and a mounted
+tmpfs exchange. An invalid root refuses rather than falling back to live
+paths. With `KEYMAN_ROOT` unset, the existing deployed Keyman paths apply.
+
 ## Forward Python installer
 
 The preferred public entry face is now:

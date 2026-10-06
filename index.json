@@ -1,13 +1,25 @@
 {
   "metadata": {
     "name": "keyman",
-    "description": "Root entry face for installing and operating the Keyman credential vault without inheriting legacy account-secret mutation semantics.",
+    "description": "Keyman credential vault front door for the Python installer and the MGLA estate-key verbs.",
     "version": "0.2.0",
     "schema_version": "1.0"
   },
   "execution": {
     "entry_point": "index.py",
     "language": "python"
+  },
+  "commands": {
+    "mgla": {
+      "entry_point": "index.py",
+      "module": "lib.keyman_mgla.index",
+      "actions": [
+        "keygen <service>",
+        "keyline <service>",
+        "sign <service>",
+        "succeed <old-service> <new-service>"
+      ]
+    }
   },
   "children": [
     "lib"

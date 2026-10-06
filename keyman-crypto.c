@@ -1,7 +1,11 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <ctype.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
@@ -11,6 +15,96 @@
 #define MAX_PASSWORD_LENGTH 512
 #define SALT_SIZE 8
 #define IV_SIZE 16
+#define MAX_CREDENTIAL_PLAINTEXT 1023
+#define MAX_SERVICE_NAME 238
+#define KEYMAN_PATH_CAP 4096
+
+static int valid_service_name(const char *service) {
+    size_t length;
+    if (!service) return 0;
+    length = strlen(service);
+    if (length == 0 || length > MAX_SERVICE_NAME) return 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char byte = (unsigned char)service[i];
+        if (!((byte >= 'a' && byte <= 'z') ||
+              (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9') || byte == '_')) return 0;
+    }
+    return 1;
+}
+
+static int build_keyman_path(const char *absolute, char *output, size_t capacity) {
+    const char *root = getenv("KEYMAN_ROOT");
+    char resolved[PATH_MAX];
+    const char *cursor;
+    if (!absolute || absolute[0] != '/') return 0;
+    if (!root) {
+        return snprintf(output, capacity, "%s", absolute) < (int)capacity;
+    }
+    if (root[0] != '/' || root[1] == '\0') return 0;
+    cursor = root;
+    while (*cursor) {
+        const char *start;
+        size_t length;
+        while (*cursor == '/') cursor++;
+        start = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        length = (size_t)(cursor - start);
+        if ((length == 1 && start[0] == '.') ||
+            (length == 2 && start[0] == '.' && start[1] == '.')) return 0;
+    }
+    if (!realpath(root, resolved) || strcmp(root, resolved) != 0) return 0;
+    return snprintf(output, capacity, "%s%s", root, absolute) < (int)capacity;
+}
+
+static int service_key_path(const char *service, char *output, size_t capacity) {
+    char absolute[512];
+    if (!valid_service_name(service)) return 0;
+    if (snprintf(absolute, sizeof(absolute), "/vault/.keys/%s.key", service) >= (int)sizeof(absolute)) return 0;
+    return build_keyman_path(absolute, output, capacity);
+}
+
+static FILE *open_output_file(const char *path, int exclusive) {
+    int descriptor;
+    FILE *stream;
+    if (!exclusive) return fopen(path, "wb");
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (descriptor < 0) return NULL;
+    stream = fdopen(descriptor, "wb");
+    if (!stream) {
+        close(descriptor);
+        unlink(path);
+    }
+    return stream;
+}
+
+static int remove_created_plaintext(const char *path) {
+    int descriptor = open(path, O_WRONLY | O_NOFOLLOW);
+    struct stat metadata;
+    unsigned char zeros[4096] = {0};
+    off_t offset = 0;
+    if (descriptor < 0) return -1;
+    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+        close(descriptor);
+        return -1;
+    }
+    while (offset < metadata.st_size) {
+        size_t amount = (size_t)((metadata.st_size - offset) < (off_t)sizeof(zeros) ?
+                                 (metadata.st_size - offset) : (off_t)sizeof(zeros));
+        ssize_t written = pwrite(descriptor, zeros, amount, offset);
+        if (written != (ssize_t)amount) {
+            close(descriptor);
+            return -1;
+        }
+        offset += written;
+    }
+    {
+        int sync_result = fsync(descriptor);
+        int close_result = close(descriptor);
+        if (sync_result != 0 || close_result != 0) return -1;
+    }
+    return unlink(path);
+}
 
 // Exit codes
 #define EXIT_SUCCESS 0
@@ -27,7 +121,12 @@ void secure_zero(void *ptr, size_t len) {
 
 // Read skeleton key
 int read_skeleton_key(char *key_buffer, size_t buffer_size) {
-    FILE *fp = fopen("/root/key/skeleton.key", "r");
+    char skeleton_path[KEYMAN_PATH_CAP];
+    if (!build_keyman_path("/root/key/skeleton.key", skeleton_path, sizeof(skeleton_path))) {
+        fprintf(stderr, "ERROR: Cannot resolve Keyman root\n");
+        return EXIT_IO_ERROR;
+    }
+    FILE *fp = fopen(skeleton_path, "r");
     if (!fp) {
         fprintf(stderr, "ERROR: Cannot read skeleton key\n");
         return EXIT_IO_ERROR;
@@ -52,12 +151,16 @@ int read_skeleton_key(char *key_buffer, size_t buffer_size) {
 
 // Read service suite key and decrypt it
 int get_service_suite_password(char *password_buffer, size_t buffer_size) {
+    char suite_path[KEYMAN_PATH_CAP];
     char skeleton_key[MAX_PASSWORD_LENGTH];
+    if (!build_keyman_path("/vault/.keys/service_suite.key", suite_path, sizeof(suite_path))) {
+        return EXIT_IO_ERROR;
+    }
     if (read_skeleton_key(skeleton_key, sizeof(skeleton_key)) != EXIT_SUCCESS) {
         return EXIT_IO_ERROR;
     }
     
-    FILE *fp = fopen("/vault/.keys/service_suite.key", "rb");
+    FILE *fp = fopen(suite_path, "rb");
     if (!fp) {
         secure_zero(skeleton_key, sizeof(skeleton_key));
         fprintf(stderr, "ERROR: Cannot read service suite key\n");
@@ -181,96 +284,99 @@ int get_service_suite_password(char *password_buffer, size_t buffer_size) {
 }
 
 // Encrypt service credentials
-int encrypt_service_credentials(const char *service, const char *username, const char *password) {
+int encrypt_service_credentials(const char *service, const char *username, const char *password, int exclusive) {
     char service_suite_password[MAX_PASSWORD_LENGTH];
+    char output_path[KEYMAN_PATH_CAP];
+    char credentials[MAX_LINE_LENGTH];
+    unsigned char salt[SALT_SIZE];
+    unsigned char key_iv[48];
+    EVP_CIPHER_CTX *ctx = NULL;
+    unsigned char *ciphertext = NULL;
+    FILE *fp = NULL;
+    int len = 0, ciphertext_len = 0, result = EXIT_CRYPTO_ERROR;
+    int credentials_len, output_created = 0;
+
+    if (!valid_service_name(service) ||
+        !service_key_path(service, output_path, sizeof(output_path))) return EXIT_INPUT_ERROR;
     if (get_service_suite_password(service_suite_password, sizeof(service_suite_password)) != EXIT_SUCCESS) {
         return EXIT_CRYPTO_ERROR;
     }
-    
-    // Create credentials content
-    char credentials[MAX_LINE_LENGTH];
-    snprintf(credentials, sizeof(credentials), "username=\"%s\"\npassword=\"%s\"\n", username, password);
-    
-    // Generate salt and IV
-    unsigned char salt[SALT_SIZE];
-    if (RAND_bytes(salt, SALT_SIZE) != 1) {
+    credentials_len = snprintf(credentials, sizeof(credentials),
+                                "username=\"%s\"\npassword=\"%s\"\n", username, password);
+    if (credentials_len < 0 || credentials_len >= (int)sizeof(credentials)) {
         secure_zero(service_suite_password, sizeof(service_suite_password));
+        secure_zero(credentials, sizeof(credentials));
+        return EXIT_INPUT_ERROR;
+    }
+    if (RAND_bytes(salt, SALT_SIZE) != 1 ||
+        PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt,
+                          SALT_SIZE, 10000, EVP_sha256(), 48, key_iv) != 1) {
+        secure_zero(service_suite_password, sizeof(service_suite_password));
+        secure_zero(credentials, sizeof(credentials));
         return EXIT_CRYPTO_ERROR;
     }
-    
-    // Derive key and IV (48 bytes total: 32 for key + 16 for IV)
-    unsigned char key_iv[48];
-    if (PKCS5_PBKDF2_HMAC(service_suite_password, strlen(service_suite_password), salt, SALT_SIZE, 10000, EVP_sha256(), 48, key_iv) != 1) {
-        secure_zero(service_suite_password, sizeof(service_suite_password));
-        return EXIT_CRYPTO_ERROR;
-    }
-    unsigned char *key = key_iv;
-    unsigned char *iv = key_iv + 32;
-    
     secure_zero(service_suite_password, sizeof(service_suite_password));
-    
-    // Encrypt
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return EXIT_CRYPTO_ERROR;
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) goto cleanup;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key_iv, key_iv + 32) != 1) goto cleanup;
+    ciphertext = malloc((size_t)credentials_len + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    if (!ciphertext) {
+        result = EXIT_IO_ERROR;
+        goto cleanup;
     }
-    
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return EXIT_CRYPTO_ERROR;
-    }
-    
-    int len, ciphertext_len;
-    unsigned char *ciphertext = malloc(strlen(credentials) + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
-    
-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char*)credentials, strlen(credentials)) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(ciphertext);
-        return EXIT_CRYPTO_ERROR;
-    }
+    if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char *)credentials, credentials_len) != 1) goto cleanup;
     ciphertext_len = len;
-    
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(ciphertext);
-        return EXIT_CRYPTO_ERROR;
-    }
+    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) goto cleanup;
     ciphertext_len += len;
-    
-    EVP_CIPHER_CTX_free(ctx);
-    
-    // Write encrypted file
-    char output_path[256];
-    snprintf(output_path, sizeof(output_path), "/vault/.keys/%s.key", service);
-    
-    FILE *fp = fopen(output_path, "wb");
+
+    fp = open_output_file(output_path, exclusive);
     if (!fp) {
-        free(ciphertext);
-        return EXIT_IO_ERROR;
+        result = EXIT_IO_ERROR;
+        goto cleanup;
     }
-    
-    // Write OpenSSL format: "Salted__" + salt + encrypted data
-    fwrite("Salted__", 1, 8, fp);
-    fwrite(salt, 1, SALT_SIZE, fp);
-    fwrite(ciphertext, 1, ciphertext_len, fp);
-    
-    fclose(fp);
-    free(ciphertext);
-    
-    return EXIT_SUCCESS;
+    output_created = 1;
+    if (fwrite("Salted__", 1, 8, fp) != 8 ||
+        fwrite(salt, 1, SALT_SIZE, fp) != SALT_SIZE ||
+        fwrite(ciphertext, 1, (size_t)ciphertext_len, fp) != (size_t)ciphertext_len ||
+        fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        result = EXIT_IO_ERROR;
+        goto cleanup;
+    }
+    if (fclose(fp) != 0) {
+        fp = NULL;
+        result = EXIT_IO_ERROR;
+        goto cleanup;
+    }
+    fp = NULL;
+    result = EXIT_SUCCESS;
+
+cleanup:
+    if (fp) fclose(fp);
+    if (result != EXIT_SUCCESS && exclusive && output_created) remove_created_plaintext(output_path);
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    if (ciphertext) {
+        secure_zero(ciphertext, (size_t)ciphertext_len);
+        free(ciphertext);
+    }
+    secure_zero(key_iv, sizeof(key_iv));
+    secure_zero(credentials, sizeof(credentials));
+    return result;
 }
+
 
 // Re-encrypt service credentials with new service suite password
 int reencrypt_service_credentials(const char *service, const char *new_suite_password) {
     char old_suite_password[MAX_PASSWORD_LENGTH];
+    char input_path[KEYMAN_PATH_CAP];
+    if (!service_key_path(service, input_path, sizeof(input_path))) {
+        return EXIT_INPUT_ERROR;
+    }
     if (get_service_suite_password(old_suite_password, sizeof(old_suite_password)) != EXIT_SUCCESS) {
         return EXIT_CRYPTO_ERROR;
     }
     
     // Read encrypted service key
-    char input_path[256];
-    snprintf(input_path, sizeof(input_path), "/vault/.keys/%s.key", service);
-    
     FILE *fp = fopen(input_path, "rb");
     if (!fp) {
         secure_zero(old_suite_password, sizeof(old_suite_password));
@@ -436,8 +542,11 @@ int reencrypt_service_credentials(const char *service, const char *new_suite_pas
     EVP_CIPHER_CTX_free(ctx);
     
     // Write re-encrypted file
-    char output_path[256];
-    snprintf(output_path, sizeof(output_path), "/vault/.keys/%s.key", service);
+    char output_path[KEYMAN_PATH_CAP];
+    if (!service_key_path(service, output_path, sizeof(output_path))) {
+        free(ciphertext);
+        return EXIT_INPUT_ERROR;
+    }
     
     fp = fopen(output_path, "wb");
     if (!fp) {
@@ -457,15 +566,21 @@ int reencrypt_service_credentials(const char *service, const char *new_suite_pas
 }
 
 // Decrypt service credentials
-int decrypt_service_credentials(const char *service, const char *output_file) {
+int decrypt_service_credentials(const char *service, const char *output_file, int exclusive) {
+    if (!valid_service_name(service)) return EXIT_INPUT_ERROR;
     // Special case: service_suite is encrypted with skeleton key, not service suite password
     if (strcmp(service, "service_suite") == 0) {
         char skeleton_key[MAX_PASSWORD_LENGTH];
+        char suite_path[KEYMAN_PATH_CAP];
+        if (!build_keyman_path("/vault/.keys/service_suite.key", suite_path, sizeof(suite_path))) {
+            return EXIT_IO_ERROR;
+        }
+
         if (read_skeleton_key(skeleton_key, sizeof(skeleton_key)) != EXIT_SUCCESS) {
             return EXIT_IO_ERROR;
         }
         
-        FILE *fp = fopen("/vault/.keys/service_suite.key", "rb");
+        FILE *fp = fopen(suite_path, "rb");
         if (!fp) {
             secure_zero(skeleton_key, sizeof(skeleton_key));
             fprintf(stderr, "ERROR: Cannot read service suite key\n");
@@ -520,14 +635,22 @@ int decrypt_service_credentials(const char *service, const char *output_file) {
         free(encrypted_data);
         
         // Write decrypted credentials to output file
-        fp = fopen(output_file, "w");
+        fp = open_output_file(output_file, exclusive);
         if (!fp) {
             free(plaintext);
             return EXIT_IO_ERROR;
         }
         
-        fwrite(plaintext, 1, plaintext_len, fp);
-        fclose(fp);
+        int output_ok = fwrite(plaintext, 1, plaintext_len, fp) == (size_t)plaintext_len &&
+                        fflush(fp) == 0 && (!exclusive || fsync(fileno(fp)) == 0);
+        if (fclose(fp) != 0) output_ok = 0;
+        if (!output_ok) {
+            if (exclusive) remove_created_plaintext(output_file);
+            secure_zero(plaintext, (size_t)file_size);
+            free(plaintext);
+            return EXIT_IO_ERROR;
+        }
+        secure_zero(plaintext, (size_t)file_size);
         free(plaintext);
         
         return EXIT_SUCCESS;
@@ -540,8 +663,11 @@ int decrypt_service_credentials(const char *service, const char *output_file) {
     }
     
     // Read encrypted service key
-    char input_path[256];
-    snprintf(input_path, sizeof(input_path), "/vault/.keys/%s.key", service);
+    char input_path[KEYMAN_PATH_CAP];
+    if (!service_key_path(service, input_path, sizeof(input_path))) {
+        secure_zero(service_suite_password, sizeof(service_suite_password));
+        return EXIT_INPUT_ERROR;
+    }
     
     FILE *fp = fopen(input_path, "rb");
     if (!fp) {
@@ -598,14 +724,22 @@ int decrypt_service_credentials(const char *service, const char *output_file) {
     free(encrypted_data);
     
     // Write decrypted credentials to output file
-    fp = fopen(output_file, "w");
+    fp = open_output_file(output_file, exclusive);
     if (!fp) {
         free(plaintext);
         return EXIT_IO_ERROR;
     }
     
-    fwrite(plaintext, 1, plaintext_len, fp);
-    fclose(fp);
+    int output_ok = fwrite(plaintext, 1, plaintext_len, fp) == (size_t)plaintext_len &&
+                    fflush(fp) == 0 && (!exclusive || fsync(fileno(fp)) == 0);
+    if (fclose(fp) != 0) output_ok = 0;
+    if (!output_ok) {
+        if (exclusive) remove_created_plaintext(output_file);
+        secure_zero(plaintext, (size_t)file_size);
+        free(plaintext);
+        return EXIT_IO_ERROR;
+    }
+    secure_zero(plaintext, (size_t)file_size);
     free(plaintext);
     
     return EXIT_SUCCESS;
@@ -697,7 +831,12 @@ int encrypt_suite_key(const char *input_file) {
     free(content);
     
     // Write encrypted service suite key
-    fp = fopen("/vault/.keys/service_suite.key", "wb");
+    char suite_path[KEYMAN_PATH_CAP];
+    if (!build_keyman_path("/vault/.keys/service_suite.key", suite_path, sizeof(suite_path))) {
+        free(ciphertext);
+        return EXIT_IO_ERROR;
+    }
+    fp = fopen(suite_path, "wb");
     if (!fp) {
         free(ciphertext);
         return EXIT_IO_ERROR;
@@ -732,12 +871,24 @@ int parse_create_input(const char *input_file, char *service, char *username, ch
         }
         
         if (strncmp(line, "service=", 8) == 0) {
+            if (!valid_service_name(line + 8)) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(service, line + 8);
             found_service = 1;
         } else if (strncmp(line, "username=", 9) == 0) {
+            if (strlen(line + 9) >= MAX_PASSWORD_LENGTH) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(username, line + 9);
             found_username = 1;
         } else if (strncmp(line, "password=", 9) == 0) {
+            if (strlen(line + 9) >= MAX_PASSWORD_LENGTH) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(password, line + 9);
             found_password = 1;
         }
@@ -770,6 +921,10 @@ int parse_decrypt_input(const char *input_file, char *service) {
         }
         
         if (strncmp(line, "service=", 8) == 0) {
+            if (!valid_service_name(line + 8)) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(service, line + 8);
             found_service = 1;
             break;
@@ -803,9 +958,17 @@ int parse_reencrypt_input(const char *input_file, char *service, char *new_passw
         }
         
         if (strncmp(line, "service=", 8) == 0) {
+            if (!valid_service_name(line + 8)) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(service, line + 8);
             found_service = 1;
         } else if (strncmp(line, "new_password=", 13) == 0) {
+            if (strlen(line + 13) >= MAX_PASSWORD_LENGTH) {
+                fclose(fp);
+                return EXIT_INPUT_ERROR;
+            }
             strcpy(new_password, line + 13);
             found_password = 1;
         }
@@ -830,9 +993,10 @@ int main(int argc, char *argv[]) {
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
     
-    if (strcmp(argv[1], "create") == 0) {
+    if (strcmp(argv[1], "create") == 0 || strcmp(argv[1], "create-exclusive") == 0) {
+        int exclusive = strcmp(argv[1], "create-exclusive") == 0;
         if (argc != 3) {
-            fprintf(stderr, "Usage: %s create <input_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s <%s> <input_file>\n", argv[0], exclusive ? "create-exclusive" : "create");
             return EXIT_USAGE_ERROR;
         }
         
@@ -840,10 +1004,12 @@ int main(int argc, char *argv[]) {
         
         int result = parse_create_input(argv[2], service, username, password);
         if (result != EXIT_SUCCESS) {
+            secure_zero(username, sizeof(username));
+            secure_zero(password, sizeof(password));
             return result;
         }
         
-        result = encrypt_service_credentials(service, username, password);
+        result = encrypt_service_credentials(service, username, password, exclusive);
         
         // Clear sensitive data
         secure_zero(username, sizeof(username));
@@ -851,9 +1017,10 @@ int main(int argc, char *argv[]) {
         
         return result;
         
-    } else if (strcmp(argv[1], "decrypt") == 0) {
+    } else if (strcmp(argv[1], "decrypt") == 0 || strcmp(argv[1], "decrypt-exclusive") == 0) {
+        int exclusive = strcmp(argv[1], "decrypt-exclusive") == 0;
         if (argc != 4) {
-            fprintf(stderr, "Usage: %s decrypt <input_file> <output_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s <%s> <input_file> <output_file>\n", argv[0], exclusive ? "decrypt-exclusive" : "decrypt");
             return EXIT_USAGE_ERROR;
         }
         
@@ -864,7 +1031,7 @@ int main(int argc, char *argv[]) {
             return result;
         }
         
-        return decrypt_service_credentials(service, argv[3]);
+        return decrypt_service_credentials(service, argv[3], exclusive);
         
     } else if (strcmp(argv[1], "reencrypt") == 0) {
         if (argc != 3) {

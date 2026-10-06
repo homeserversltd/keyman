@@ -1599,7 +1599,36 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman <init|newkey|export|delete|rotate-suite> ... | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username>"
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username>"
+}
+
+fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
+    if paths.rooted && paths.root == Path::new("/") {
+        return Err(KeymanError::Input(
+            "KEYMAN_ROOT must not be filesystem root",
+        ));
+    }
+    let script = paths.fixed("vault/keyman/index.py");
+    let metadata = fs::symlink_metadata(&script)
+        .map_err(|_| KeymanError::Io("MGLA Python front door is missing"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KeymanError::Io(
+            "MGLA Python front door is not a regular file",
+        ));
+    }
+    let status = Command::new("python3")
+        .arg(&script)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|_| KeymanError::Io("cannot invoke MGLA Python front door"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(KeymanError::Input("MGLA Python operation refused"))
+    }
 }
 
 fn run_internal_cleanup(args: &[String]) -> Result<()> {
@@ -1690,6 +1719,12 @@ fn run(args: &mut [String]) -> Result<()> {
         return Ok(());
     }
     let paths = Paths::from_environment()?;
+    if args[0] == "mgla" {
+        let mut python_args = Vec::with_capacity(args.len());
+        python_args.push("mgla".to_owned());
+        python_args.extend(args[1..].iter().cloned());
+        return run_mgla_python(&paths, &python_args);
+    }
     if args[0] == "crypto" {
         return run_crypto(&paths, &args[1..]);
     }
