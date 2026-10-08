@@ -291,7 +291,8 @@ class KeymanInstaller:
             raise InstallerError("install requires root for vault paths, chpasswd, tmpfs, and permissions; rerun with sudo or use plan")
 
     def _do_build_keyman_crypto(self, action: Action) -> None:
-        self._run(["make"], cwd=self.options.paths.source_dir)
+        # -B: the repo also tracks the legacy binary field HomeServers pull; always rebuild from source.
+        self._run(["make", "-B"], cwd=self.options.paths.source_dir)
         action.status = "done"
 
     def _do_copy_runtime_tree(self, action: Action) -> None:
