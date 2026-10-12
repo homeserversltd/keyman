@@ -14,6 +14,8 @@ use std::thread;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
+mod crown;
+
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
 type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
 
@@ -37,6 +39,7 @@ enum KeymanError {
     Input(&'static str),
     Io(&'static str),
     Crypto,
+    CrownExit(i32),
 }
 
 impl KeymanError {
@@ -46,6 +49,7 @@ impl KeymanError {
             Self::Io(_) => 2,
             Self::Input(_) => 3,
             Self::Usage(_) => 4,
+            Self::CrownExit(code) => *code,
         }
     }
 
@@ -53,19 +57,20 @@ impl KeymanError {
         match self {
             Self::Usage(message) | Self::Input(message) | Self::Io(message) => message,
             Self::Crypto => "cryptographic operation failed",
+            Self::CrownExit(_) => "",
         }
     }
 }
 
 type Result<T> = std::result::Result<T, KeymanError>;
 
-struct Paths {
-    root: PathBuf,
-    rooted: bool,
+pub(crate) struct Paths {
+    pub(crate) root: PathBuf,
+    pub(crate) rooted: bool,
 }
 
 impl Paths {
-    fn from_environment() -> Result<Self> {
+    pub(crate) fn from_environment() -> Result<Self> {
         let raw = env::var_os("KEYMAN_ROOT");
         let rooted = raw.is_some();
         let raw = raw.unwrap_or_else(|| OsString::from("/"));
@@ -90,7 +95,7 @@ impl Paths {
         Ok(Self { root, rooted })
     }
 
-    fn fixed(&self, relative: &str) -> PathBuf {
+    pub(crate) fn fixed(&self, relative: &str) -> PathBuf {
         self.root.join(relative)
     }
 
@@ -156,7 +161,7 @@ impl Paths {
         self.fixed("mnt/keyexchange")
     }
 
-    fn ensure_directories(&self, relative: &str) -> Result<PathBuf> {
+    pub(crate) fn ensure_directories(&self, relative: &str) -> Result<PathBuf> {
         let rel = Path::new(relative);
         if rel.is_absolute()
             || rel
@@ -217,7 +222,7 @@ impl Paths {
         Ok(path)
     }
 
-    fn check_fixed_parent(&self, relative: &str) -> Result<PathBuf> {
+    pub(crate) fn check_fixed_parent(&self, relative: &str) -> Result<PathBuf> {
         let rel = Path::new(relative);
         if rel.is_absolute()
             || rel
@@ -252,7 +257,7 @@ impl Paths {
         self.check_fixed_parent(&relative)
     }
 
-    fn read_skeleton(&self) -> Result<Zeroizing<Vec<u8>>> {
+    pub(crate) fn read_skeleton(&self) -> Result<Zeroizing<Vec<u8>>> {
         let relative = "root/key/skeleton.key";
         let path = self.check_fixed_parent(relative)?;
         let bytes = Zeroizing::new(read_regular_file(
@@ -270,7 +275,7 @@ impl Paths {
         Ok(Zeroizing::new(bytes[..end].to_vec()))
     }
 
-    fn read_key(&self, service: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_key(&self, service: &str) -> Result<Vec<u8>> {
         let path = self.checked_key_path(service)?;
         read_regular_file(&path, MAX_ENCRYPTED_FILE, "cannot read encrypted key")
     }
@@ -298,7 +303,7 @@ fn exchange_tmpfs_is_mounted() -> bool {
     })
 }
 
-fn read_regular_file(path: &Path, limit: u64, message: &'static str) -> Result<Vec<u8>> {
+pub(crate) fn read_regular_file(path: &Path, limit: u64, message: &'static str) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).map_err(|_| io_error(message))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(io_error(message));
@@ -370,7 +375,7 @@ fn random_hex(bytes_len: usize) -> Result<String> {
     Ok(result)
 }
 
-fn write_atomic_with_identity(path: &Path, bytes: &[u8]) -> Result<(u64, u64)> {
+pub(crate) fn write_atomic_with_identity(path: &Path, bytes: &[u8]) -> Result<(u64, u64)> {
     let parent = path
         .parent()
         .filter(|candidate| !candidate.as_os_str().is_empty())
@@ -429,7 +434,7 @@ fn write_atomic_with_identity(path: &Path, bytes: &[u8]) -> Result<(u64, u64)> {
     Ok(identity)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_atomic_with_identity(path, bytes).map(|_| ())
 }
 
@@ -444,7 +449,7 @@ fn derive_key_iv(password: &[u8], salt: &[u8]) -> ([u8; 32], [u8; 16]) {
     (key, iv)
 }
 
-fn encrypt_blob(password: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encrypt_blob(password: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     if plaintext.len() > MAX_CRYPTO_INPUT as usize {
         return Err(KeymanError::Input("input exceeds the supported size limit"));
     }
@@ -466,7 +471,7 @@ fn encrypt_blob(password: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn decrypt_blob(password: &[u8], encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn decrypt_blob(password: &[u8], encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if encrypted.len() > MAX_ENCRYPTED_FILE as usize
         || encrypted.len() < 16 + AES_BLOCK_LEN
         || (encrypted.len() - 16) % AES_BLOCK_LEN != 0
@@ -512,7 +517,7 @@ fn validate_field_value(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn format_credentials(username: &[u8], password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn format_credentials(username: &[u8], password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     validate_field_value(username)?;
     validate_field_value(password)?;
     let total = b"username=\"\"\npassword=\"\"\n".len() + username.len() + password.len();
@@ -530,7 +535,7 @@ fn format_credentials(username: &[u8], password: &[u8]) -> Result<Zeroizing<Vec<
     Ok(content)
 }
 
-fn extract_quoted_field(plaintext: &[u8], field: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn extract_quoted_field(plaintext: &[u8], field: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if plaintext.contains(&0) {
         return Err(KeymanError::Crypto);
     }
@@ -570,7 +575,7 @@ fn encrypt_service_key(paths: &Paths, service: &str, content: &[u8]) -> Result<(
     paths.write_key(service, &encrypted)
 }
 
-fn decrypt_service_key(paths: &Paths, service: &str) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn decrypt_service_key(paths: &Paths, service: &str) -> Result<Zeroizing<Vec<u8>>> {
     let encrypted = paths.read_key(service)?;
     if service == "service_suite" {
         let skeleton = paths.read_skeleton()?;
@@ -754,7 +759,12 @@ fn native_init(paths: &Paths) -> Result<Value> {
     Ok(Value::Object(receipt))
 }
 
-fn native_newkey(paths: &Paths, service: &str, username: &str, password: &str) -> Result<Value> {
+pub(crate) fn native_newkey(
+    paths: &Paths,
+    service: &str,
+    username: &str,
+    password: &str,
+) -> Result<Value> {
     validate_service(service, true)?;
     let content = format_credentials(username.as_bytes(), password.as_bytes())?;
     encrypt_service_key(paths, service, &content)?;
@@ -785,7 +795,7 @@ fn native_delete(paths: &Paths, service: &str) -> Result<Value> {
     Ok(Value::Object(receipt))
 }
 
-fn secure_remove_if_identity(path: &Path, device: u64, inode: u64) -> Result<bool> {
+pub(crate) fn secure_remove_if_identity(path: &Path, device: u64, inode: u64) -> Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -850,12 +860,32 @@ fn schedule_export_cleanup(service: &str, device: u64, inode: u64) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn native_export_to_directory(
+    paths: &Paths,
+    service: &str,
+    exchange: &Path,
+) -> Result<(PathBuf, u64, u64)> {
+    validate_service(service, false)?;
+    let plaintext = decrypt_service_key(paths, service)?;
+    native_write_export_to_directory(service, &plaintext, exchange)
+}
+
+pub(crate) fn native_write_export_to_directory(
+    service: &str,
+    plaintext: &[u8],
+    exchange: &Path,
+) -> Result<(PathBuf, u64, u64)> {
+    let output = exchange.join(service);
+    let (device, inode) = write_atomic_with_identity(&output, plaintext)?;
+    Ok((output, device, inode))
+}
+
 fn native_export(paths: &Paths, service: &str) -> Result<Value> {
     validate_service(service, false)?;
     let plaintext = decrypt_service_key(paths, service)?;
     let exchange = paths.exchange_directory()?;
-    let output = exchange.join(service);
-    let (device, inode) = write_atomic_with_identity(&output, &plaintext)?;
+    let (output, device, inode) =
+        native_write_export_to_directory(service, &plaintext, &exchange)?;
     if let Err(error) = schedule_export_cleanup(service, device, inode) {
         let _ = secure_remove_if_identity(&output, device, inode);
         return Err(error);
@@ -1048,13 +1078,13 @@ fn cryptsetup_backing_device(mapper: &str) -> Result<String> {
     Ok(device.to_owned())
 }
 
-struct SecretMemfd {
+pub(crate) struct SecretMemfd {
     file: File,
     length: usize,
 }
 
 impl SecretMemfd {
-    fn new(secret: &[u8]) -> Result<Self> {
+    pub(crate) fn new(secret: &[u8]) -> Result<Self> {
         let name = CString::new("keyman-new-passphrase")
             .map_err(|_| KeymanError::Io("cannot prepare new passphrase"))?;
         let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
@@ -1072,7 +1102,7 @@ impl SecretMemfd {
         })
     }
 
-    fn raw_fd(&self) -> i32 {
+    pub(crate) fn raw_fd(&self) -> i32 {
         self.file.as_raw_fd()
     }
 }
@@ -1599,7 +1629,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username>"
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
 }
 
 fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
@@ -1690,6 +1720,9 @@ fn run(args: &mut [String]) -> Result<()> {
         println!("{}", usage());
         return Ok(());
     }
+    if crown::is_verb(args[0].as_str()) {
+        return Err(KeymanError::CrownExit(crown::run(args)));
+    }
     if args[0] == "update-luks" {
         let drive = args
             .get(1)
@@ -1774,7 +1807,12 @@ fn main() {
         argument.zeroize();
     }
     if let Err(error) = result {
-        eprintln!("ERROR: {}", error.message());
-        std::process::exit(error.exit_code());
+        match error {
+            KeymanError::CrownExit(code) => std::process::exit(code),
+            error => {
+                eprintln!("ERROR: {}", error.message());
+                std::process::exit(error.exit_code());
+            }
+        }
     }
 }
