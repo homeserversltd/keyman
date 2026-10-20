@@ -1,0 +1,46 @@
+# Keyman migration map
+
+Migration is additive: legacy field files remain byte-for-byte at their existing
+paths for already-deployed field updaters. The new installer, Rust verbs, and
+MGLA band do not execute these scripts or the C helper.
+
+## Legacy shell scripts → native or in-process doors
+
+| Retained field file | New technology door |
+|---|---|
+| `keystartup.sh` | `python3 index.py install` for installer policy; Rust `keyman init` for native hierarchy initialization. |
+| `newkey.sh` | Rust `keyman newkey SERVICE USER PASSWORD` compatibility form; MGLA uses the bounded `keyman newkey --stdin SERVICE` form. |
+| `exportkey.sh` | Rust `keyman export --scoped SERVICE` for one-operation exports; unscoped `keyman export SERVICE` remains field compatibility with its existing cleanup timer. |
+| `deletekey.sh` | Rust `keyman delete SERVICE`. |
+| `change_service_suite_key.sh` | Rust `keyman rotate-suite --stdin` with one JSON object on stdin; older Rust argv rotation forms remain compatible. |
+| `updateLuksKey.sh` | Rust `keyman update-luks <nas|nas_backup> ...` native operation. |
+| `updateTransmissionKey.sh` | Rust `keyman update-transmission ...` native operation. |
+| `utils.sh` | Rust path custody, credential formatting, exchange-tmpfs observation, cryptographic, secure-cleanup, and service helpers. |
+
+## C helper and build mapping
+
+`keyman-crypto.c` and the existing `keyman-crypto` binary remain unchanged for
+field-only compatibility. Their crypto primitives are carried by Rust
+`keyman crypto create`, `decrypt`, `reencrypt`, and `encrypt_suite_key` plus the
+native encrypted-key operations. New installation builds only with
+`make -f Makefile.rust DIST_BINARY=rust/target/keyman-x86_64` and installs that
+Rust artifact as `runtime_dir/keyman`; it does not invoke the legacy Makefile,
+generic `make`, the C binary, or a shell script. Runtime copying omits Rust
+target/cache directories. The retained installer option `--no-build-crypto`
+requires an already installed executable at the declared runtime path.
+
+The new MGLA path calls only `keyman newkey --stdin SERVICE` and
+`keyman export --scoped SERVICE`; private seed bytes are stdin-only. The Rust
+MGLA launcher supplies its resolved non-secret binary path as `KEYMAN_BINARY`.
+Direct Python MGLA resolves only `runtime_dir/keyman`, and refuses with
+`keyman-rust-binary-missing` if it cannot. The installer seeds Caduceus through
+its existing `_write_encrypted_key` implementation, using the SHA-256 identity
+of raw skeleton-key bytes and the actual service-suite password; it does not
+invoke `newkey.sh` or the Rust newkey argv form.
+
+## Byte-preservation boundary
+
+The eight scripts above, `keyman-crypto.c`, the legacy `Makefile`, and the
+tracked C binary are intentionally carried untouched. No new technology path
+falls back to them, and this map does not authorize deletion or rewriting of
+legacy field material.

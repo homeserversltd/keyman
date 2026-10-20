@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Keyman root entry face.
+"""Keyman Python installer and MGLA front door.
 
-The source-declared ``mgla`` verb family is dispatched here alongside the
-existing Python installer. The Rust keyman binary enters this same front door
-for MGLA operations; credential storage and export stay on the shell/C ladder.
+New installation, Caduceus seeding, and service-suite rotation use the
+Rust runtime or the existing in-process encrypted-key writer. The MGLA family
+is delegated to native Rust Keyman doors and never to the preserved shell/C
+field tools.
 """
 
 from __future__ import annotations

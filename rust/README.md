@@ -1,6 +1,42 @@
 # Native Rust Keyman crown verbs
 
-These additions to the Rust `keyman` binary keep the older v1 verbs intact and add four native crown operations. The existing Caduceus staff caller at `sbin/caduceus_staff/keyman.py` remains an OPEN integration dependency; this change does not alter that caller or its wire format.
+These additions to the Rust `keyman` binary keep the older v1 verbs intact and add native crown operations plus bounded stdin/scoped vault doors. The existing Caduceus staff caller at `sbin/caduceus_staff/keyman.py` remains an OPEN integration dependency; this change does not alter that caller or its wire format. The preserved shell/C field tools are not invoked by the new Rust installer or MGLA technology.
+
+## Native vault verbs
+
+```text
+keyman newkey --stdin SERVICE
+keyman export --scoped SERVICE
+keyman rotate-suite --stdin
+```
+
+`newkey --stdin` accepts exactly `mgla` + LF, 64 lowercase hexadecimal
+seed bytes, and one final LF: exactly 70 bytes with no trailing byte. Input
+is bounded and zeroized. It requires an actual exchange tmpfs even under
+`KEYMAN_ROOT`, then creates the encrypted service key exclusively with mode
+`0600`; an existing file or symlink is refused. The existing argv-based
+`newkey SERVICE USER PASSWORD` form remains for compatibility.
+
+`export --scoped SERVICE` requires an actual exchange tmpfs and creates
+`exchange/SERVICE` exclusively with mode `0600`. It refuses any existing path
+and never starts a cleanup child or timer; the caller owns cleanup of its
+export. The unscoped export mode and its timer remain unchanged.
+
+`rotate-suite --stdin` reads one bounded JSON object with `current_password`
+and `new_password`. It validates and zeroizes the document, checks the current
+suite password before mutation, and emits a secret-free native receipt. The
+existing argv rotation forms remain unchanged.
+
+The Rust MGLA launcher exports its resolved, non-secret executable path to the
+Python front door as `KEYMAN_BINARY`. Direct Python MGLA may resolve the
+installed `runtime_dir/keyman` binary. A missing binary is refused as
+`keyman-rust-binary-missing`; there is no shell or C fallback. The Python
+installer builds with `Makefile.rust`, directs output to
+`rust/target/keyman-x86_64`, installs the executable as `runtime_dir/keyman`,
+and excludes Rust target/cache directories from runtime copying. Its
+`--no-build-crypto` compatibility flag requires an existing runtime binary.
+Caduceus seed uses the installer's in-process encrypted-key writer, not a
+`newkey` command; OpenSSL receives the actual passphrase through stdin.
 
 ## Invocation and input
 
@@ -11,7 +47,7 @@ keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|f
 keyman admin-password
 ```
 
-`key-status` takes no secret input. The other verbs read exactly one JSON object from stdin; passwords are never command-line arguments. Inputs reject empty values, NUL, CR, newline, double quote, or values longer than 511 bytes to preserve Keyman’s existing quoted credential-file format. Unknown JSON fields are ignored and zeroized with the parsed document. The optional `planned` field defaults to false when absent or null; a non-boolean non-null value is refused. Illustrative payload shapes use placeholders only and are not runnable credentials:
+`key-status` takes no secret input. The crown mutation verbs read exactly one JSON object from stdin; passwords are never command-line arguments. Inputs reject empty values, NUL, CR, newline, double quote, or values longer than 511 bytes to preserve Keyman’s existing quoted credential-file format. Unknown JSON fields are ignored and zeroized with the parsed document. The optional `planned` field defaults to false when absent or null; a non-boolean non-null value is refused. Illustrative payload shapes use placeholders only and are not runnable credentials:
 
 ```json
 {"password":"<new password supplied through protected stdin>","planned":true}

@@ -29,6 +29,8 @@ const MAX_EXPLICIT_OUTPUT_PATH: usize = 256;
 const MAX_FIELD_VALUE: usize = 511;
 const MAX_C_LINE: usize = 1023;
 const MAX_CREDENTIAL_PLAINTEXT: usize = 1023;
+const MAX_SECRET_JSON: u64 = 64 * 1024;
+const MGLA_STDIN_BYTES: usize = 70;
 const MAX_SETTINGS_FILE: u64 = 1024 * 1024;
 const CLEANUP_DELAY_SECONDS: u64 = 15;
 const PASSWORD_ALPHABET: &[u8] = b"0123456789abcdef";
@@ -91,6 +93,13 @@ impl Paths {
             .map_err(|_| KeymanError::Io("cannot resolve KEYMAN_ROOT"))?;
         if !root.is_dir() {
             return Err(KeymanError::Io("KEYMAN_ROOT is not a directory"));
+        }
+        if rooted
+            && (root == Path::new("/") || root.as_os_str() != requested.as_os_str())
+        {
+            return Err(KeymanError::Input(
+                "KEYMAN_ROOT must be canonical and must not be filesystem root",
+            ));
         }
         Ok(Self { root, rooted })
     }
@@ -222,6 +231,26 @@ impl Paths {
         Ok(path)
     }
 
+    fn scoped_exchange_directory(&self) -> Result<PathBuf> {
+        if self.rooted && self.root == Path::new("/") {
+            return Err(KeymanError::Input(
+                "KEYMAN_ROOT must not be filesystem root",
+            ));
+        }
+        let path = self.check_fixed_parent("mnt/keyexchange")?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| KeymanError::Io("cannot inspect key-exchange directory"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(KeymanError::Io("key-exchange path is not a directory"));
+        }
+        if !exchange_tmpfs_is_mounted_at(&path) {
+            return Err(KeymanError::Io(
+                "required key-exchange tmpfs is not mounted",
+            ));
+        }
+        Ok(path)
+    }
+
     pub(crate) fn check_fixed_parent(&self, relative: &str) -> Result<PathBuf> {
         let rel = Path::new(relative);
         if rel.is_absolute()
@@ -303,6 +332,25 @@ fn exchange_tmpfs_is_mounted() -> bool {
     })
 }
 
+fn exchange_tmpfs_is_mounted_at(path: &Path) -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let expected = path
+        .to_string_lossy()
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011");
+    mounts.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+            return false;
+        };
+        fields.get(4).copied() == Some(expected.as_str())
+            && fields.get(separator + 1) == Some(&"tmpfs")
+    })
+}
+
 pub(crate) fn read_regular_file(path: &Path, limit: u64, message: &'static str) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).map_err(|_| io_error(message))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -359,6 +407,60 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(u64, u64)> {
     if file.write_all(bytes).is_err() || file.sync_all().is_err() {
         let _ = fs::remove_file(path);
         return Err(KeymanError::Io("cannot write key file"));
+    }
+    Ok(identity)
+}
+
+fn write_new_exclusive(
+    path: &Path,
+    bytes: &[u8],
+    exists_message: &'static str,
+) -> Result<(u64, u64)> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            KeymanError::Io(exists_message)
+        } else {
+            KeymanError::Io("cannot create exclusive key file")
+        }
+    })?;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            drop(file);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(KeymanError::Io("cannot clean partial exclusive key file")),
+            }
+            return Err(KeymanError::Io("cannot inspect exclusive key file"));
+        }
+    };
+    let identity = (metadata.dev(), metadata.ino());
+    let result = (|| {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| KeymanError::Io("cannot secure exclusive key file"))?;
+        file.write_all(bytes)
+            .map_err(|_| KeymanError::Io("cannot write exclusive key file"))?;
+        file.sync_all()
+            .map_err(|_| KeymanError::Io("cannot sync exclusive key file"))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(file);
+        let removed = secure_remove_if_identity(path, identity.0, identity.1).unwrap_or(false);
+        if !removed {
+            match fs::symlink_metadata(path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(KeymanError::Io("cannot clean partial exclusive key file")),
+            }
+        }
+        return Err(error);
     }
     Ok(identity)
 }
@@ -774,6 +876,38 @@ pub(crate) fn native_newkey(
     Ok(Value::Object(receipt))
 }
 
+fn native_newkey_stdin(paths: &Paths, service: &str) -> Result<Value> {
+    validate_service(service, true)?;
+    let _exchange = paths.scoped_exchange_directory()?;
+    let mut input = Zeroizing::new(Vec::with_capacity(MGLA_STDIN_BYTES + 1));
+    std::io::stdin()
+        .lock()
+        .take(MGLA_STDIN_BYTES as u64 + 1)
+        .read_to_end(&mut input)
+        .map_err(|_| KeymanError::Io("cannot read MGLA credential input"))?;
+    if input.len() != MGLA_STDIN_BYTES
+        || &input[..5] != b"mgla\n"
+        || input[69] != b'\n'
+        || !input[5..69]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(KeymanError::Input("invalid MGLA credential input"));
+    }
+
+    let content = format_credentials(b"mgla", &input[5..69])?;
+    let skeleton = paths.read_skeleton()?;
+    let suite = suite_password(paths, &skeleton)?;
+    let encrypted = encrypt_blob(&suite, &content)?;
+    let target = paths.checked_key_path(service)?;
+    write_new_exclusive(&target, &encrypted, "key file already exists")?;
+
+    let mut receipt = receipt_base("newkey");
+    receipt.insert("service".into(), Value::String(service.to_owned()));
+    receipt.insert("secret_free".into(), Value::Bool(true));
+    Ok(Value::Object(receipt))
+}
+
 fn native_delete(paths: &Paths, service: &str) -> Result<Value> {
     validate_service(service, false)?;
     let path = paths.checked_key_path(service)?;
@@ -903,6 +1037,24 @@ fn native_export(paths: &Paths, service: &str) -> Result<Value> {
     Ok(Value::Object(receipt))
 }
 
+fn native_export_scoped(paths: &Paths, service: &str) -> Result<Value> {
+    validate_service(service, false)?;
+    let exchange = paths.scoped_exchange_directory()?;
+    let plaintext = decrypt_service_key(paths, service)?;
+    let output = exchange.join(service);
+    let (device, inode) =
+        write_new_exclusive(&output, &plaintext, "exchange artifact already exists")?;
+    let mut receipt = receipt_base("export-scoped");
+    receipt.insert(
+        "exchange_file".into(),
+        Value::String(output.to_string_lossy().into_owned()),
+    );
+    receipt.insert("export_device".into(), Value::from(device));
+    receipt.insert("export_inode".into(), Value::from(inode));
+    receipt.insert("secret_free".into(), Value::Bool(true));
+    Ok(Value::Object(receipt))
+}
+
 fn cleanup_export(paths: &Paths, service: &str, device: u64, inode: u64) -> Result<()> {
     validate_service(service, false)?;
     thread::sleep(Duration::from_secs(CLEANUP_DELAY_SECONDS));
@@ -914,18 +1066,102 @@ fn cleanup_export(paths: &Paths, service: &str, device: u64, inode: u64) -> Resu
     secure_remove_if_identity(&path, device, inode).map(|_| ())
 }
 
+struct SecretJson(Value);
+
+impl Drop for SecretJson {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.0);
+    }
+}
+
+fn zeroize_json_value(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => {
+            for item in items {
+                zeroize_json_value(item);
+            }
+        }
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (mut key, mut value) in entries {
+                key.zeroize();
+                zeroize_json_value(&mut value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn read_secret_json() -> Result<SecretJson> {
+    let stdin = std::io::stdin();
+    let mut raw = Zeroizing::new(Vec::new());
+    stdin
+        .lock()
+        .take(MAX_SECRET_JSON + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| KeymanError::Io("cannot read secret JSON input"))?;
+    if raw.len() as u64 > MAX_SECRET_JSON {
+        return Err(KeymanError::Input("secret JSON input exceeds the supported size limit"));
+    }
+    let document = SecretJson(
+        serde_json::from_slice(&raw).map_err(|_| KeymanError::Input("invalid secret JSON input"))?,
+    );
+    if !document.0.is_object() {
+        return Err(KeymanError::Input("secret JSON input must be an object"));
+    }
+    Ok(document)
+}
+
+fn secret_json_field(document: &SecretJson, name: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let value = document
+        .0
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or(KeymanError::Input("secret JSON input is missing a password field"))?;
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_FIELD_VALUE
+        || bytes.contains(&0)
+        || bytes.contains(&b'\n')
+        || bytes.contains(&b'\r')
+        || bytes.contains(&b'"')
+    {
+        return Err(KeymanError::Input("secret JSON password is invalid"));
+    }
+    Ok(Zeroizing::new(bytes.to_vec()))
+}
+
 fn native_rotate_suite(paths: &Paths, new_password: Option<&str>) -> Result<Value> {
-    paths.ensure_key_directories()?;
+    native_rotate_suite_checked(paths, None, new_password.map(str::as_bytes))
+}
+
+fn native_rotate_suite_checked(
+    paths: &Paths,
+    expected_current: Option<&[u8]>,
+    new_password: Option<&[u8]>,
+) -> Result<Value> {
+    if expected_current.is_none() {
+        paths.ensure_key_directories()?;
+    }
     let skeleton = paths.read_skeleton()?;
     let current_password = suite_password(paths, &skeleton)?;
+    if expected_current.is_some_and(|expected| expected != current_password.as_slice()) {
+        return Err(KeymanError::Input("current service-suite password did not match"));
+    }
+    if expected_current.is_some() && new_password == Some(current_password.as_slice()) {
+        return Err(KeymanError::Input(
+            "new service-suite password must differ from current",
+        ));
+    }
     let generated_password;
     let next_password: Zeroizing<Vec<u8>> = match new_password {
         Some(value) => {
-            validate_field_value(value.as_bytes())?;
+            validate_field_value(value)?;
             if value.is_empty() {
                 return Err(KeymanError::Input("new suite password must not be empty"));
             }
-            Zeroizing::new(value.as_bytes().to_vec())
+            Zeroizing::new(value.to_vec())
         }
         None => {
             generated_password = generate_skeleton_secret()?;
@@ -1629,7 +1865,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> (MGLA payload on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
 }
 
 fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
@@ -1646,9 +1882,18 @@ fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
             "MGLA Python front door is not a regular file",
         ));
     }
+    let executable = env::current_exe()
+        .and_then(|path| fs::canonicalize(path))
+        .map_err(|_| KeymanError::Io("keyman-rust-binary-missing"))?;
+    let executable_metadata = fs::metadata(&executable)
+        .map_err(|_| KeymanError::Io("keyman-rust-binary-missing"))?;
+    if !executable_metadata.is_file() {
+        return Err(KeymanError::Io("keyman-rust-binary-missing"));
+    }
     let status = Command::new("python3")
         .arg(&script)
         .args(args)
+        .env("KEYMAN_BINARY", executable)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1778,13 +2023,35 @@ fn run(args: &mut [String]) -> Result<()> {
             emit_receipt(receipt);
             Ok(())
         }
+        "newkey" if args.len() == 3 && args[1] == "--stdin" => {
+            let receipt = native_newkey_stdin(&paths, &args[2])?;
+            emit_receipt(receipt);
+            Ok(())
+        }
         "export" if args.len() == 2 => {
             let receipt = native_export(&paths, &args[1])?;
             emit_receipt(receipt);
             Ok(())
         }
+        "export" if args.len() == 3 && args[1] == "--scoped" => {
+            let receipt = native_export_scoped(&paths, &args[2])?;
+            emit_receipt(receipt);
+            Ok(())
+        }
         "delete" if args.len() == 2 => {
             let receipt = native_delete(&paths, &args[1])?;
+            emit_receipt(receipt);
+            Ok(())
+        }
+        "rotate-suite" if args.len() == 2 && args[1] == "--stdin" => {
+            let document = read_secret_json()?;
+            let current = secret_json_field(&document, "current_password")?;
+            let next = secret_json_field(&document, "new_password")?;
+            let receipt = native_rotate_suite_checked(
+                &paths,
+                Some(current.as_slice()),
+                Some(next.as_slice()),
+            )?;
             emit_receipt(receipt);
             Ok(())
         }

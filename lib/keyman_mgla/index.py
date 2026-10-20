@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""MGLA key operations over Keyman's existing credential ladder.
+"""MGLA key operations through the native Rust Keyman binary.
 
-Private seeds enter only through newkey.sh stdin and leave only through the
-operation-scoped exportkey.sh path. The module never generates, exports, or
-signs a key from a CI process.
+Private seeds enter only through ``keyman newkey --stdin SERVICE`` and leave
+only through the operation-scoped ``keyman export --scoped SERVICE`` door.
+The module never invokes legacy scripts or generates, exports, or signs a key
+from a CI process.
 """
 
 from __future__ import annotations
@@ -140,7 +141,8 @@ def exchange_is_tmpfs(path: Path) -> bool:
 
 
 def require_exchange(exchange: Path) -> None:
-    if not exchange.is_dir() or not exchange_is_tmpfs(exchange):
+    require_directory(exchange, "key-exchange-tmpfs-missing")
+    if not exchange_is_tmpfs(exchange):
         refuse("key-exchange-tmpfs-missing")
 
 
@@ -179,26 +181,45 @@ def key_id(public: bytes) -> str:
 
 
 def keyman_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["KEYMAN_MGLA_SCOPED"] = "1"
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "KEYMAN_MGLA_SCOPED": "1",
+    }
+    if "KEYMAN_ROOT" in os.environ:
+        environment["KEYMAN_ROOT"] = os.environ["KEYMAN_ROOT"]
     return environment
 
 
-def run_ladder(script: Path, arguments: list[str], *, input_bytes: bytearray | None = None) -> None:
+def keyman_binary(runtime: Path) -> Path:
+    supplied = os.environ.get("KEYMAN_BINARY")
+    candidate = Path(supplied) if supplied is not None else runtime / "keyman"
+    if not candidate.is_absolute():
+        refuse("keyman-rust-binary-missing")
+    try:
+        resolved = candidate.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError:
+        refuse("keyman-rust-binary-missing")
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+        refuse("keyman-rust-binary-missing")
+    return resolved
+
+
+def run_keyman(binary: Path, arguments: list[str], *, input_bytes: bytearray | None = None) -> None:
     try:
         result = subprocess.run(
-            [str(script), *arguments],
+            [str(binary), *arguments],
             input=input_bytes,
             stdin=None if input_bytes is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=keyman_environment(),
             check=False,
         )
     except OSError:
-        refuse("keyman-ladder-unavailable")
+        refuse("keyman-rust-binary-missing")
     if result.returncode != 0:
-        refusal = "keyman-newkey-failed" if "newkey.sh" in script.name else "keyman-export-failed"
+        refusal = "keyman-newkey-failed" if arguments[0] == "newkey" else "keyman-export-failed"
         refuse(refusal)
 
 
@@ -296,7 +317,7 @@ def read_seed_file(path: Path) -> bytearray:
 
 
 @contextmanager
-def exported_seed(service: str, exchange: Path, runtime: Path) -> Iterator[bytearray]:
+def exported_seed(service: str, exchange: Path, binary: Path) -> Iterator[bytearray]:
     validate_service(service)
     output = exchange / service
     try:
@@ -307,7 +328,7 @@ def exported_seed(service: str, exchange: Path, runtime: Path) -> Iterator[bytea
         refuse("exchange-artifact-unreadable")
     else:
         refuse("exchange-artifact-exists")
-    run_ladder(runtime / "exportkey.sh", ["--scoped", service])
+    run_keyman(binary, ["export", "--scoped", service])
     identity: tuple[int, int] | None = None
     seed: bytearray | None = None
     try:
@@ -349,26 +370,26 @@ def validate_body(body: bytes) -> bytes:
     return body
 
 
-def mglakey(service: str, skeleton: Path, suite: Path, vault: Path, exchange: Path, runtime: Path) -> str:
+def mglakey(service: str, skeleton: Path, suite: Path, vault: Path, exchange: Path, binary: Path) -> str:
     validate_service(service)
     require_regular(vault / f"{service}.key", "credential-missing")
     with mgla_lock(skeleton):
         require_exchange(exchange)
-        with exported_seed(service, exchange, runtime) as seed:
+        with exported_seed(service, exchange, binary) as seed:
             private = make_private(seed)
             public = public_key(private)
             identifier = key_id(public)
             return f"MGLA-KEY1|key={identifier}|pub={encoded(public)}"
 
 
-def sign_body(service: str, body: bytes, skeleton: Path, suite: Path, vault: Path, exchange: Path, runtime: Path) -> bytes:
+def sign_body(service: str, body: bytes, skeleton: Path, suite: Path, vault: Path, exchange: Path, binary: Path) -> bytes:
     validate_service(service)
     literal_body = validate_body(body)
     require_regular(vault / f"{service}.key", "credential-missing")
     with mgla_lock(skeleton):
         require_exchange(exchange)
         signature: bytes | None = None
-        with exported_seed(service, exchange, runtime) as seed:
+        with exported_seed(service, exchange, binary) as seed:
             private = make_private(seed)
             public = public_key(private)
             identifier = key_id(public)
@@ -381,7 +402,7 @@ def sign_body(service: str, body: bytes, skeleton: Path, suite: Path, vault: Pat
         return literal_body + b"|sig=" + encoded(signature).encode("ascii")
 
 
-def succession(old_service: str, new_service: str, skeleton: Path, suite: Path, vault: Path, exchange: Path, runtime: Path) -> str:
+def succession(old_service: str, new_service: str, skeleton: Path, suite: Path, vault: Path, exchange: Path, binary: Path) -> str:
     validate_service(old_service)
     validate_service(new_service)
     if old_service == new_service:
@@ -392,11 +413,11 @@ def succession(old_service: str, new_service: str, skeleton: Path, suite: Path, 
         require_exchange(exchange)
         signature: bytes | None = None
         body: str | None = None
-        with exported_seed(old_service, exchange, runtime) as old_seed:
+        with exported_seed(old_service, exchange, binary) as old_seed:
             old_private = make_private(old_seed)
             old_public = public_key(old_private)
             old_id = key_id(old_public)
-            with exported_seed(new_service, exchange, runtime) as new_seed:
+            with exported_seed(new_service, exchange, binary) as new_seed:
                 new_private = make_private(new_seed)
                 new_public = public_key(new_private)
                 new_id = key_id(new_public)
@@ -410,9 +431,9 @@ def succession(old_service: str, new_service: str, skeleton: Path, suite: Path, 
         return body + "|ssig=" + encoded(signature)
 
 
-def keygen(service: str, paths: tuple[Path, Path, Path, Path, Path]) -> list[str]:
+def keygen(service: str, paths: tuple[Path, Path, Path, Path, Path], binary: Path) -> list[str]:
     validate_service(service)
-    skeleton, suite, vault, exchange, runtime = paths
+    skeleton, suite, vault, exchange, _runtime = paths
     if not sys.stdin.isatty():
         refuse("keygen-requires-tty")
     if any(name in os.environ for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "WOODPECKER", "BUILDKITE", "JENKINS_URL")):
@@ -431,7 +452,7 @@ def keygen(service: str, paths: tuple[Path, Path, Path, Path, Path]) -> list[str
         seed = bytearray(os.urandom(32))
         payload = bytearray(b"mgla\n" + seed.hex().encode("ascii") + b"\n")
         try:
-            run_ladder(runtime / "newkey.sh", ["--stdin", service], input_bytes=payload)
+            run_keyman(binary, ["newkey", "--stdin", service], input_bytes=payload)
             private = make_private(seed)
             public = public_key(private)
             identifier = key_id(public)
@@ -468,15 +489,16 @@ def main(argv: list[str] | None = None) -> int:
             if any(name in os.environ for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "WOODPECKER", "BUILDKITE", "JENKINS_URL")):
                 refuse("keygen-forbidden-in-ci")
         paths = require_hierarchy()
+        binary = keyman_binary(paths[4])
         if action == "keygen" and len(arguments) == 2:
-            output = keygen(arguments[1], paths)
+            output = keygen(arguments[1], paths, binary)
         elif action == "keyline" and len(arguments) == 2:
-            output = [mglakey(arguments[1], *paths)]
+            output = [mglakey(arguments[1], *paths[:4], binary)]
         elif action == "sign" and len(arguments) == 2:
             body = sys.stdin.buffer.read(MAX_BODY_BYTES + 1)
-            output = [sign_body(arguments[1], body, *paths)]
+            output = [sign_body(arguments[1], body, *paths[:4], binary)]
         elif action == "succeed" and len(arguments) == 3:
-            output = [succession(arguments[1], arguments[2], *paths)]
+            output = [succession(arguments[1], arguments[2], *paths[:4], binary)]
         else:
             refuse("usage-error", 2)
         for line in output:

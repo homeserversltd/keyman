@@ -1,40 +1,40 @@
 # Keyman installer band
 
-This band is the forward-only Python installer for Keyman. It keeps the old C
-crypto helper and shell tools alive, but moves installation policy into explicit
-profiles and flags.
+The Python installer remains the public install front door, but new runtime
+technology uses the Rust Keyman binary. Installation builds it with
+`Makefile.rust`, directs the artifact to `rust/target/keyman-x86_64` (inside
+the ignored Rust target tree), and installs it as `runtime_dir/keyman`.
+Runtime copying excludes Rust target/cache directories. No generic `make`, C
+binary, shell-script, or `PATH` fallback is used. The compatibility flag
+`--no-build-crypto` skips the Rust build and requires an existing executable at
+the declared runtime path.
 
-Important profiles:
-
-- `vault-only`: install/runtime initialize Keyman without changing system
-  account secrets.
-- `field-node`: set the configured operator account for local TTY access when
-  an access secret is explicitly supplied, keep SSH interactive authentication
-  disabled, and initialize the Keyman vault without writing the deploy secret
-  file.
-- `full-deploy`: compatibility full deploy posture for the original full-system
-  lane.
-
-Run from the Keyman repo root:
-
-```bash
-python3 index.py
-python3 index.py plan --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
-sudo KEYMAN_ADMIN_SECRET='<operator-local-secret>' python3 index.py install --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
+```text
+python3 index.py plan --profile vault-only
+sudo python3 index.py install --profile vault-only
+python3 index.py rotate --dry-run --profile vault-only
 ```
 
-Receipts redact secret material.
+`KEYMAN_ROOT`, when set, must be an existing canonical absolute non-root
+directory. The installer maps its default Keyman runtime, key, vault, exchange,
+deploy-secret, and SSH paths beneath that root. Custom path overrides that
+cannot be mapped to the Rust fixed paths are refused before mutation; they are
+never ignored or allowed to fall back to live paths.
 
-## Optional Caduceus seed extension
+The Caduceus seed is written by the existing `_write_encrypted_key` method,
+not by a `newkey.sh` ceremony. It preserves the SHA-256 identity derived from
+the raw skeleton-key bytes and encrypts with the actual service-suite password.
+The passphrase is delivered to OpenSSL on stdin using `-pass stdin` and is not
+put in argv or environment variables.
 
-The Keyman installer can extend a Keyman installation with a Caduceus
-credential after the vault hierarchy stands. The extension always invokes the
-existing `newkey.sh` ceremony; it does not implement a second key writer.
+Service-suite rotation invokes `runtime_dir/keyman rotate-suite --stdin` with
+one bounded JSON object on stdin. The Rust verb validates and compares the
+current service-suite password before changing keys; the installer suppresses
+child stdout/stderr and returns only a named, secret-free refusal.
 
-```bash
-sudo python3 index.py install --profile vault-only --install-caduceus --seed-caduceus-pin
-```
-
-The bare seed option uses PIN `1`. Supply an environment or file source for a
-different PIN. The receipt redacts the PIN. Existing `caduceus.key` is
-preserved unless `--force-caduceus-pin` is explicit.
+The MGLA band uses only native Rust `keyman newkey --stdin SERVICE` and
+`keyman export --scoped SERVICE`. Its lock, TTY/CI restrictions, exclusive
+creation, exchange-tmpfs requirement, and process-owned export cleanup remain
+in force. Neither this installer nor the MGLA band invokes the old shell/C
+field tools. Those files remain byte-preserved for legacy field updater use;
+see root `MIGRATED.txt`.

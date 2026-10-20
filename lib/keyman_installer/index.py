@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Forward-only Python installer for Keyman.
+"""Forward-only Python installer for the Rust Keyman runtime.
 
-This is the new explicit installer membrane for the small Keyman vault system.
-It preserves the existing shell/C runtime while making installation intent
-visible: vault-only, field-node local-console secret, and homeserver full
-deploy are separate profiles instead of implicit branches hidden inside
-``keystartup.sh``.
+The installer builds and supplies the native Rust binary, keeps the historical
+field scripts byte-for-byte as carried compatibility files, and routes new
+key creation, scoped export, and service-suite rotation through Rust or the
+existing in-process encrypted-key writer.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import string
 import subprocess
 import sys
@@ -29,6 +29,15 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_CONFIG = ROOT / "index.json"
 REDACTED = "[REDACTED]"
+RUST_RUNTIME_PATHS = {
+    "runtime_dir": (Path("/vault/keyman"), Path("vault/keyman")),
+    "key_dir": (Path("/root/key"), Path("root/key")),
+    "vault_dir": (Path("/vault/.keys"), Path("vault/.keys")),
+    "exchange_dir": (Path("/mnt/keyexchange"), Path("mnt/keyexchange")),
+    "deploy_secret_file": (Path("/deploy/operator-secret.txt"), Path("deploy/operator-secret.txt")),
+    "sshd_dropin": (Path("/etc/ssh/sshd_config.d/99-keyman-operator-access.conf"), Path("etc/ssh/sshd_config.d/99-keyman-operator-access.conf")),
+}
+RUST_FIXED_PATHS = {"runtime_dir", "key_dir", "vault_dir", "exchange_dir"}
 
 
 @dataclass
@@ -113,7 +122,7 @@ class KeymanInstaller:
     def plan(self) -> list[Action]:
         p = self.options.paths
         if self.options.build_crypto:
-            self.actions.append(Action("build-keyman-crypto", str(p.source_dir), True))
+            self.actions.append(Action("build-keyman-rust", str(p.source_dir), True))
         if self.options.copy_runtime:
             self.actions.append(Action("copy-runtime-tree", f"{p.source_dir} -> {p.runtime_dir}", True))
         if self.options.init_vault:
@@ -170,11 +179,24 @@ class KeymanInstaller:
                 action.status = "dry-run"
             return self.receipt(ok=True, first_missing_signal="none")
 
+        native_actions = {"seed-caduceus-key", "rotate-service-suite"}
+        if any(action.name in native_actions for action in self.actions):
+            supplied_by_this_run = self.options.build_crypto and self.options.copy_runtime
+            if not supplied_by_this_run and not self._regular_executable(self.options.paths.runtime_dir / "keyman"):
+                raise InstallerError("keyman-rust-binary-missing")
         self._require_root_for_mutations()
         for action in self.actions:
             handler = getattr(self, f"_do_{action.name.replace('-', '_')}")
             handler(action)
         return self.receipt(ok=True, first_missing_signal="none")
+
+    @staticmethod
+    def _regular_executable(path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return False
+        return stat.S_ISREG(metadata.st_mode) and os.access(path, os.X_OK)
 
     def verify(self) -> dict[str, Any]:
         p = self.options.paths
@@ -184,10 +206,7 @@ class KeymanInstaller:
         access_binding = self._access_artifact_matches(access_module, access_artifact)
         checks = {
             "runtime_dir": p.runtime_dir.is_dir(),
-            "keyman_crypto": (p.runtime_dir / "keyman-crypto").exists(),
-            "utils_sh": (p.runtime_dir / "utils.sh").exists(),
-            "newkey_sh": (p.runtime_dir / "newkey.sh").exists(),
-            "exportkey_sh": (p.runtime_dir / "exportkey.sh").exists(),
+            "keyman_rust_binary": self._regular_executable(p.runtime_dir / "keyman"),
             "caduceus_access_module": access_module.is_file(),
             "caduceus_access_artifact": access_artifact.is_file(),
             "caduceus_access_source_binding": access_binding,
@@ -203,7 +222,7 @@ class KeymanInstaller:
             True,
             detail={"identity": "sha256-raw-skeleton-bytes", "pin": REDACTED},
         )
-        if all(checks[name] for name in ("runtime_dir", "newkey_sh", "key_dir", "vault_dir", "skeleton_key", "service_suite_key")):
+        if all(checks[name] for name in ("runtime_dir", "keyman_rust_binary", "key_dir", "vault_dir", "skeleton_key", "service_suite_key")):
             if not (p.vault_dir / "caduceus.key").is_file() or self.options.force_caduceus_pin:
                 self._require_root_for_mutations()
             self._do_seed_caduceus_key(seed_action)
@@ -290,31 +309,67 @@ class KeymanInstaller:
         if hasattr(os, "geteuid") and os.geteuid() != 0:
             raise InstallerError("install requires root for vault paths, chpasswd, tmpfs, and permissions; rerun with sudo or use plan")
 
-    def _do_build_keyman_crypto(self, action: Action) -> None:
-        # -B: the repo also tracks the legacy binary field HomeServers pull; always rebuild from source.
-        self._run(["make", "-B"], cwd=self.options.paths.source_dir)
+    def _do_build_keyman_rust(self, action: Action) -> None:
+        source_dir = self.options.paths.source_dir
+        self._run(
+            [
+                "make",
+                "-f",
+                "Makefile.rust",
+                "DIST_BINARY=rust/target/keyman-x86_64",
+            ],
+            cwd=source_dir,
+        )
+        artifact = source_dir / "rust" / "target" / "keyman-x86_64"
+        if not self._regular_executable(artifact):
+            raise InstallerError("keyman-rust-binary-missing")
         action.status = "done"
 
     def _do_copy_runtime_tree(self, action: Action) -> None:
         src = self.options.paths.source_dir.resolve()
         dst = self.options.paths.runtime_dir.resolve()
-        if src == dst:
-            action.status = "skipped"
-            action.detail["reason"] = "source-is-runtime"
-            return
-        dst.mkdir(parents=True, exist_ok=True)
-        os.chmod(dst, 0o700)
-        for item in src.iterdir():
-            if item.name in {".git", "__pycache__", ".pytest_cache"}:
-                continue
-            target = dst / item.name
-            if item.is_dir():
-                if target.exists():
-                    shutil.rmtree(target)
-                shutil.copytree(item, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
-            else:
-                shutil.copy2(item, target)
-            self._secure_runtime_path(target)
+        binary_source = src / "rust" / "target" / "keyman-x86_64"
+        binary_target = dst / "keyman"
+        if self.options.build_crypto:
+            if not self._regular_executable(binary_source):
+                raise InstallerError("keyman-rust-binary-missing")
+        elif not self._regular_executable(binary_target):
+            raise InstallerError("keyman-rust-binary-missing")
+
+        if src != dst:
+            dst.mkdir(parents=True, exist_ok=True)
+            os.chmod(dst, 0o700)
+            for item in src.iterdir():
+                if item.name in {".git", "__pycache__", ".pytest_cache", "target", "dist"}:
+                    continue
+                target = dst / item.name
+                if item.is_dir():
+                    if target.exists():
+                        shutil.rmtree(target)
+                    shutil.copytree(
+                        item,
+                        target,
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.pyc", ".git", ".pytest_cache", "target", "dist"
+                        ),
+                    )
+                else:
+                    shutil.copy2(item, target)
+                self._secure_runtime_path(target)
+
+        if self.options.build_crypto:
+            if binary_target.is_symlink() or (binary_target.exists() and not binary_target.is_file()):
+                raise InstallerError("unsafe-keyman-rust-runtime-target")
+            with tempfile.NamedTemporaryFile(dir=dst, prefix=".keyman-", delete=False) as handle:
+                temporary = Path(handle.name)
+            try:
+                shutil.copyfile(binary_source, temporary)
+                os.chmod(temporary, 0o700)
+                os.replace(temporary, binary_target)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            self._secure_runtime_path(binary_target)
         action.status = "done"
 
     def _secure_runtime_path(self, path: Path) -> None:
@@ -323,7 +378,7 @@ class KeymanInstaller:
             for child in path.rglob("*"):
                 self._secure_runtime_path(child)
             return
-        executable_names = {"keyman-crypto", "index.py"}
+        executable_names = {"keyman", "keyman-crypto", "index.py"}
         if path.suffix == ".sh" or path.name in executable_names:
             os.chmod(path, 0o700)
         else:
@@ -377,7 +432,7 @@ class KeymanInstaller:
         action.status = "done"
 
     def _do_seed_caduceus_key(self, action: Action) -> None:
-        """Seed Caduceus only through the existing Keyman newkey ceremony."""
+        """Seed Caduceus in process using the actual service-suite password."""
         target = self.options.paths.vault_dir / "caduceus.key"
         if target.exists() and not self.options.force_caduceus_pin:
             action.status = "skipped"
@@ -388,14 +443,14 @@ class KeymanInstaller:
             raise InstallerError("Caduceus PIN seed was not selected")
         self._reject_unquoted_keyman_value(pin, "Caduceus PIN")
         skeleton = self.options.paths.skeleton_key
-        ceremony = self.options.paths.runtime_dir / "newkey.sh"
-        required = (skeleton, self.options.paths.service_suite_key, ceremony)
-        if not all(path.is_file() for path in required):
+        suite = self.options.paths.service_suite_key
+        if not skeleton.is_file() or not suite.is_file():
             raise InstallerError("caduceus-key-seed-prerequisite-missing")
         identity = hashlib.sha256(skeleton.read_bytes()).hexdigest()
-        self._run([str(ceremony), "caduceus", identity, pin])
+        service_suite_password = self._decrypt_service_suite_secret()
+        self._write_encrypted_key(target, identity, pin, service_suite_password)
         if not target.is_file():
-            raise InstallerError("caduceus-key-seed-missing-after-ceremony")
+            raise InstallerError("caduceus-key-seed-missing-after-write")
         os.chmod(target, 0o600)
         action.status = "done"
 
@@ -403,45 +458,32 @@ class KeymanInstaller:
         password = self.options.admin_secret
         if not password:
             raise InstallerError("setting admin secret requires --admin-secret, --admin-secret-env, or --admin-secret-file")
-        self._run(["chpasswd"], input_text=f"{self.options.admin_user}:{password}\n")
+        self._run(["chpasswd"], input_text=f"{self.options.admin_user}:{password}\n", suppress_stderr=True)
         action.status = "done"
 
     def _do_rotate_service_suite(self, action: Action) -> None:
         current_secret = self.options.current_service_suite_secret
         new_secret = self.options.new_service_suite_secret
         if not current_secret or not new_secret:
-            raise InstallerError("rotating service suite requires --current-service-suite-secret-* and --new-service-suite-secret-*")
+            raise InstallerError("rotating service suite requires current and new service-suite secrets")
         if current_secret == new_secret:
             raise InstallerError("new service-suite secret must differ from current service-suite secret")
+        self._reject_unquoted_keyman_value(current_secret, "current service-suite secret")
         self._reject_unquoted_keyman_value(new_secret, "new service-suite secret")
-        observed = self._decrypt_service_suite_secret()
-        if observed != current_secret:
-            raise InstallerError("current service-suite secret did not match installed service_suite.key")
-        services = self._service_key_names()
-        for service_name in services:
-            self._run([str(self.options.paths.runtime_dir / "exportkey.sh"), service_name])
-        for service_name in services:
-            decrypted = self.options.paths.exchange_dir / service_name
-            if not decrypted.exists():
-                raise InstallerError(f"exported service payload missing for {service_name}")
-            reencrypt_input = self.options.paths.exchange_dir / f"reencrypt_{service_name}_{os.getpid()}"
-            reencrypt_input.write_text(f"service={service_name}\nnew_password={new_secret}\n", encoding="utf-8")
-            os.chmod(reencrypt_input, 0o600)
-            try:
-                self._run([str(self.options.paths.runtime_dir / "keyman-crypto"), "reencrypt", str(reencrypt_input)])
-            finally:
-                self._shred_or_unlink(reencrypt_input)
-                self._shred_or_unlink(decrypted)
-        suite_plain = self.options.paths.exchange_dir / "service_suite.rotate"
-        suite_plain.parent.mkdir(parents=True, exist_ok=True)
-        suite_plain.write_text(f'username="service_suite"\npassword="{new_secret}"\n', encoding="utf-8")
-        os.chmod(suite_plain, 0o600)
+        if "\r" in current_secret or "\0" in current_secret or "\r" in new_secret or "\0" in new_secret:
+            raise InstallerError("service-suite secret contains an unsupported character")
+        payload = bytearray(
+            json.dumps(
+                {"current_password": current_secret, "new_password": new_secret},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         try:
-            self._run([str(self.options.paths.runtime_dir / "keyman-crypto"), "encrypt_suite_key", str(suite_plain)])
+            self._run_keyman(["rotate-suite", "--stdin"], input_bytes=payload)
         finally:
-            self._shred_or_unlink(suite_plain)
+            payload[:] = b"\0" * len(payload)
         action.status = "done"
-        action.detail["service_key_count"] = len(services)
+        action.detail["native_operation"] = "rotate-suite"
 
     def _decrypt_service_suite_secret(self) -> str:
         suite = self.options.paths.service_suite_key
@@ -535,8 +577,10 @@ class KeymanInstaller:
                     "-out",
                     str(target),
                     "-pass",
-                    f"file:{self.options.paths.skeleton_key}",
-                ]
+                    "stdin",
+                ],
+                input_text=master_secret + "\n",
+                suppress_stderr=True,
             )
             os.chmod(target, 0o600)
         finally:
@@ -558,14 +602,40 @@ class KeymanInstaller:
     def _reject_unquoted_keyman_value(self, value: str, label: str) -> None:
         if not value:
             raise InstallerError(f"{label} cannot be empty")
-        if '"' in value or "\n" in value:
-            raise InstallerError(f"{label} cannot contain a double quote or newline because legacy keyman-crypto parses quoted values")
+        if '"' in value or "\n" in value or "\r" in value or "\0" in value:
+            raise InstallerError(f"{label} cannot contain a double quote, newline, carriage return, or NUL in Keyman's quoted credential format")
 
-    def _run(self, argv: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    def _run(self, argv: list[str], *, cwd: Path | None = None, input_text: str | None = None, suppress_stderr: bool = False) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(argv, cwd=cwd, input=input_text, text=True, capture_output=True, check=False)
         if result.returncode != 0:
+            if suppress_stderr:
+                raise InstallerError(f"command failed: {argv[0]} exited {result.returncode}")
             raise InstallerError(f"command failed: {argv[0]} exited {result.returncode}: {result.stderr.strip()}")
         return result
+
+    def _native_keyman_environment(self) -> dict[str, str]:
+        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if "KEYMAN_ROOT" in os.environ:
+            environment["KEYMAN_ROOT"] = os.environ["KEYMAN_ROOT"]
+        return environment
+
+    def _run_keyman(self, arguments: list[str], *, input_bytes: bytearray) -> None:
+        binary = self.options.paths.runtime_dir / "keyman"
+        if not self._regular_executable(binary):
+            raise InstallerError("keyman-rust-binary-missing")
+        try:
+            result = subprocess.run(
+                [str(binary), *arguments],
+                input=input_bytes,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self._native_keyman_environment(),
+                check=False,
+            )
+        except OSError:
+            raise InstallerError("keyman-rust-binary-missing") from None
+        if result.returncode != 0:
+            raise InstallerError("keyman-rotate-suite-failed")
 
     def _shred_or_unlink(self, path: Path) -> None:
         if not path.exists():
@@ -584,17 +654,78 @@ def load_root_config() -> dict[str, Any]:
     return json.loads(ROOT_CONFIG.read_text(encoding="utf-8"))
 
 
+def resolve_keyman_root() -> Path | None:
+    raw = os.environ.get("KEYMAN_ROOT")
+    if raw is None:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute() or raw == "/" or raw.endswith("/"):
+        raise InstallerError("unsafe-keyman-root")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        raise InstallerError("keyman-root-missing") from None
+    if str(resolved) != raw or not resolved.is_dir():
+        raise InstallerError("unsafe-keyman-root")
+    return resolved
+
+
+def _validate_rooted_path(path: Path, root: Path, *, directory: bool) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise InstallerError("keyman-root-path-override-unmappable") from None
+    current = root
+    components = relative.parts
+    for index, component in enumerate(components):
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            raise InstallerError("unsafe-keyman-root-path") from None
+        is_final = index == len(components) - 1
+        if stat.S_ISLNK(metadata.st_mode):
+            raise InstallerError("unsafe-keyman-root-path")
+        if not is_final or directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise InstallerError("unsafe-keyman-root-path")
+        elif not stat.S_ISREG(metadata.st_mode):
+            raise InstallerError("unsafe-keyman-root-path")
+
+
 def default_paths(config: dict[str, Any], source_dir: Path) -> InstallPaths:
-    paths = config.get("paths", {})
-    return InstallPaths(
+    configured = config.get("paths", {})
+    root = resolve_keyman_root()
+    resolved: dict[str, Path] = {}
+    for name, (host_path, relative_path) in RUST_RUNTIME_PATHS.items():
+        supplied = Path(configured.get(name, str(host_path)))
+        if root is None:
+            if name in RUST_FIXED_PATHS and supplied != host_path:
+                raise InstallerError("keyman-path-override-unmappable")
+            resolved[name] = supplied
+        else:
+            rooted_path = root / relative_path
+            if supplied not in (host_path, rooted_path):
+                raise InstallerError("keyman-root-path-override-unmappable")
+            resolved[name] = rooted_path
+
+    paths = InstallPaths(
         source_dir=source_dir,
-        runtime_dir=Path(paths.get("runtime_dir", "/vault/keyman")),
-        key_dir=Path(paths.get("key_dir", "/root/key")),
-        vault_dir=Path(paths.get("vault_dir", "/vault/.keys")),
-        exchange_dir=Path(paths.get("exchange_dir", "/mnt/keyexchange")),
-        deploy_secret_file=Path(paths.get("deploy_secret_file", "/deploy/operator-secret.txt")),
-        sshd_dropin=Path(paths.get("sshd_dropin", "/etc/ssh/sshd_config.d/99-keyman-operator-access.conf")),
+        runtime_dir=resolved["runtime_dir"],
+        key_dir=resolved["key_dir"],
+        vault_dir=resolved["vault_dir"],
+        exchange_dir=resolved["exchange_dir"],
+        deploy_secret_file=resolved["deploy_secret_file"],
+        sshd_dropin=resolved["sshd_dropin"],
     )
+    if root is not None:
+        for path in (paths.runtime_dir, paths.key_dir, paths.vault_dir, paths.exchange_dir):
+            _validate_rooted_path(path, root, directory=True)
+        _validate_rooted_path(paths.deploy_secret_file, root, directory=False)
+        _validate_rooted_path(paths.sshd_dropin, root, directory=False)
+    return paths
 
 
 def resolve_secret(*, literal: str | None, env_name: str | None, file_path: str | None, label: str) -> str | None:
@@ -625,12 +756,25 @@ def build_options(ns: argparse.Namespace) -> InstallOptions:
 
     source_dir = Path(ns.source_dir).resolve() if ns.source_dir else ROOT
     paths = default_paths(config, source_dir)
-    paths.runtime_dir = Path(ns.runtime_dir or paths.runtime_dir)
-    paths.key_dir = Path(ns.key_dir or paths.key_dir)
-    paths.vault_dir = Path(ns.vault_dir or paths.vault_dir)
-    paths.exchange_dir = Path(ns.exchange_dir or paths.exchange_dir)
-    paths.deploy_secret_file = Path(ns.deploy_secret_file or paths.deploy_secret_file)
-    paths.sshd_dropin = Path(ns.sshd_dropin or paths.sshd_dropin)
+    keyman_root = resolve_keyman_root()
+    for name, supplied in (
+        ("runtime_dir", ns.runtime_dir),
+        ("key_dir", ns.key_dir),
+        ("vault_dir", ns.vault_dir),
+        ("exchange_dir", ns.exchange_dir),
+        ("deploy_secret_file", ns.deploy_secret_file),
+        ("sshd_dropin", ns.sshd_dropin),
+    ):
+        if supplied is None:
+            continue
+        candidate = Path(supplied)
+        expected = getattr(paths, name)
+        if name in RUST_FIXED_PATHS and candidate != expected:
+            signal = "keyman-root-path-override-unmappable" if keyman_root is not None else "keyman-path-override-unmappable"
+            raise InstallerError(signal)
+        if keyman_root is not None and candidate != expected:
+            raise InstallerError("keyman-root-path-override-unmappable")
+        setattr(paths, name, candidate)
 
     admin_secret = resolve_secret(
         literal=ns.admin_secret,
@@ -715,7 +859,7 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--deploy-secret-file")
     parser.add_argument("--sshd-dropin")
     parser.add_argument("--admin-user")
-    parser.add_argument("--admin-secret", help="Explicit admin secret. Prefer --admin-secret-env or --admin-secret-file outside disposable lab flows.")
+    parser.add_argument("--admin-secret", help="Explicit admin secret; prefer a protected file source")
     parser.add_argument("--admin-secret-env", help="Environment variable containing the admin secret")
     parser.add_argument("--admin-secret-file", help="File containing the admin secret")
     parser.add_argument("--master-secret", help="Explicit Keyman master/skeleton secret. Usually omit to generate.")
@@ -725,13 +869,13 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--current-service-suite-secret-file", help="File containing the current service-suite secret for rotate")
     parser.add_argument("--new-service-suite-secret-env", help="Environment variable containing the new service-suite secret for rotate")
     parser.add_argument("--new-service-suite-secret-file", help="File containing the new service-suite secret for rotate")
-    parser.add_argument("--rotate-service-suite", action="store_true", help="Rotate service_suite.key and rewrap existing service keys")
+    parser.add_argument("--rotate-service-suite", action="store_true", help="Rotate service_suite.key and rewrap existing service keys through Rust stdin")
     parser.add_argument("--set-admin-secret", dest="set_admin_secret", action="store_true", default=None)
     parser.add_argument("--no-set-admin-secret", dest="set_admin_secret", action="store_false")
     parser.add_argument("--write-deploy-secret", dest="write_deploy_secret", action="store_true", default=None)
     parser.add_argument("--no-write-deploy-secret", dest="write_deploy_secret", action="store_false")
     parser.add_argument("--ssh-interactive-auth", dest="ssh_interactive_auth", choices=["keep", "disable", "enable"])
-    parser.add_argument("--no-build-crypto", action="store_true")
+    parser.add_argument("--no-build-crypto", action="store_true", help="Compatibility flag: skip the Rust build and require an existing runtime/keyman binary")
     parser.add_argument("--no-copy-runtime", action="store_true")
     parser.add_argument("--no-init-vault", action="store_true")
     parser.add_argument("--no-nas-key", action="store_true")
@@ -741,7 +885,7 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed-caduceus-pin", nargs="?", const="1", help="Override the native Caduceus seed PIN; bare option uses PIN 1")
     parser.add_argument("--seed-caduceus-pin-env", help="Environment variable containing the Caduceus seed PIN")
     parser.add_argument("--seed-caduceus-pin-file", help="File containing the Caduceus seed PIN")
-    parser.add_argument("--force-caduceus-pin", action="store_true", help="Replace an existing caduceus.key through the standard ceremony")
+    parser.add_argument("--force-caduceus-pin", action="store_true", help="Replace an existing caduceus.key using the in-process encrypted-key writer")
     parser.add_argument("--restart-ssh", action="store_true")
     parser.add_argument("--receipt", help="Write JSON receipt to this path as well as stdout")
     parser.add_argument("--dry-run", action="store_true", help="Plan without mutating even under install")
@@ -768,17 +912,22 @@ def examples() -> str:
 Examples:
   python3 index.py
   python3 index.py plan --profile vault-only
-  python3 index.py plan --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
-  sudo KEYMAN_ADMIN_SECRET=<operator-local-secret> python3 index.py install --profile field-node --admin-secret-env KEYMAN_ADMIN_SECRET
-  python3 index.py rotate --dry-run --profile field-node --admin-secret-env NEW_OWNER_SECRET --current-service-suite-secret-env CURRENT_KEYMAN_SECRET --new-service-suite-secret-env NEW_KEYMAN_SECRET
+  sudo python3 index.py install --profile vault-only
+  python3 index.py rotate --dry-run --profile vault-only
 
 Profile intent:
   vault-only             initialize Keyman without changing OS account secrets
-  field-node             operator local TTY secret supplied explicitly; SSH remains key-only
-  full-deploy compatibility full deploy posture; use with care
+  field-node             local-console policy, with secret sources kept out of argv
+  full-deploy            compatibility full-system posture
+
+Runtime supply:
+  The installer builds with Makefile.rust and installs the Rust binary as
+  runtime_dir/keyman. --no-build-crypto requires that runtime binary to exist.
+  KEYMAN_ROOT must name an existing canonical absolute non-root directory.
 
 Secret law:
-  Receipts redact secret material. Prefer env/file secret sources over literal CLI flags.
+  Receipts redact secret material. Service-suite rotation sends one JSON object
+  to the Rust binary on stdin; secrets are not passed in its argv or environment.
 """
 
 

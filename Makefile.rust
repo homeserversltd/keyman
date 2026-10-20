@@ -10,7 +10,7 @@ all: build
 
 build:
 	$(RUST_CARGO) build --release --manifest-path $(RUST_MANIFEST) --target-dir $(RUST_TARGET_DIR)
-	mkdir -p dist
+	mkdir -p $(dir $(DIST_BINARY))
 	install -m 0755 $(RUST_BINARY) $(DIST_BINARY)
 
 clean:
