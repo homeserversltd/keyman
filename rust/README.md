@@ -6,16 +6,25 @@ These additions to the Rust `keyman` binary keep the older v1 verbs intact and a
 
 ```text
 keyman newkey --stdin SERVICE
+keyman newkey --stdin SERVICE --replace
 keyman export --scoped SERVICE
 keyman rotate-suite --stdin
 ```
 
-`newkey --stdin` accepts exactly `mgla` + LF, 64 lowercase hexadecimal
-seed bytes, and one final LF: exactly 70 bytes with no trailing byte. Input
-is bounded and zeroized. It requires an actual exchange tmpfs even under
-`KEYMAN_ROOT`, then creates the encrypted service key exclusively with mode
-`0600`; an existing file or symlink is refused. The existing argv-based
-`newkey SERVICE USER PASSWORD` form remains for compatibility.
+`newkey --stdin` accepts exactly `username="<user>"` LF
+`password="<password>"` LF, including the final LF and with no trailing bytes.
+Each value is nonempty and at most 511 bytes; NUL, CR, LF, and double quote
+are refused. There are no escapes, normalization, extra fields, or trailing
+bytes. Spaces, `$`, `!`, and Unicode are allowed within the byte limits, and
+the accepted bytes are encrypted and exported unchanged. The bounded input
+buffer is zeroized.
+
+By default, the key is created exclusively with mode `0600`; an existing file
+or symlink is refused. The explicit `--replace` form uses the existing argv
+form's safe atomic overwrite semantics and still refuses symlinks. The
+exchange directory must be an actual mounted tmpfs even under `KEYMAN_ROOT`.
+The existing argv-based `newkey SERVICE USER PASSWORD` form remains for
+compatibility.
 
 `export --scoped SERVICE` requires an actual exchange tmpfs and creates
 `exchange/SERVICE` exclusively with mode `0600`. It refuses any existing path

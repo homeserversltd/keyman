@@ -30,7 +30,7 @@ const MAX_FIELD_VALUE: usize = 511;
 const MAX_C_LINE: usize = 1023;
 const MAX_CREDENTIAL_PLAINTEXT: usize = 1023;
 const MAX_SECRET_JSON: u64 = 64 * 1024;
-const MGLA_STDIN_BYTES: usize = 70;
+const MAX_NEWKEY_STDIN: usize = b"username=\"\"\npassword=\"\"\n".len() + 2 * MAX_FIELD_VALUE;
 const MAX_SETTINGS_FILE: u64 = 1024 * 1024;
 const CLEANUP_DELAY_SECONDS: u64 = 15;
 const PASSWORD_ALPHABET: &[u8] = b"0123456789abcdef";
@@ -876,31 +876,64 @@ pub(crate) fn native_newkey(
     Ok(Value::Object(receipt))
 }
 
-fn native_newkey_stdin(paths: &Paths, service: &str) -> Result<Value> {
+fn validate_newkey_stdin_field(value: &[u8]) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_FIELD_VALUE
+        || value
+            .iter()
+            .any(|byte| matches!(*byte, b'\0' | b'\r' | b'\n' | b'"'))
+    {
+        return Err(KeymanError::Input("invalid credential input"));
+    }
+    Ok(())
+}
+
+fn parse_newkey_stdin(input: &[u8]) -> Result<()> {
+    let input = input
+        .strip_prefix(b"username=\"")
+        .ok_or(KeymanError::Input("invalid credential input"))?;
+    let username_end = input
+        .iter()
+        .position(|byte| *byte == b'"')
+        .ok_or(KeymanError::Input("invalid credential input"))?;
+    validate_newkey_stdin_field(&input[..username_end])?;
+    let input = input[username_end + 1..]
+        .strip_prefix(b"\npassword=\"")
+        .ok_or(KeymanError::Input("invalid credential input"))?;
+    let password_end = input
+        .iter()
+        .position(|byte| *byte == b'"')
+        .ok_or(KeymanError::Input("invalid credential input"))?;
+    validate_newkey_stdin_field(&input[..password_end])?;
+    if &input[password_end + 1..] != b"\n" {
+        return Err(KeymanError::Input("invalid credential input"));
+    }
+    Ok(())
+}
+
+fn native_newkey_stdin(paths: &Paths, service: &str, replace: bool) -> Result<Value> {
     validate_service(service, true)?;
     let _exchange = paths.scoped_exchange_directory()?;
-    let mut input = Zeroizing::new(Vec::with_capacity(MGLA_STDIN_BYTES + 1));
+    let mut input = Zeroizing::new(Vec::with_capacity(MAX_NEWKEY_STDIN + 1));
     std::io::stdin()
         .lock()
-        .take(MGLA_STDIN_BYTES as u64 + 1)
+        .take(MAX_NEWKEY_STDIN as u64 + 1)
         .read_to_end(&mut input)
-        .map_err(|_| KeymanError::Io("cannot read MGLA credential input"))?;
-    if input.len() != MGLA_STDIN_BYTES
-        || &input[..5] != b"mgla\n"
-        || input[69] != b'\n'
-        || !input[5..69]
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
-        return Err(KeymanError::Input("invalid MGLA credential input"));
+        .map_err(|_| KeymanError::Io("cannot read credential input"))?;
+    if input.len() > MAX_NEWKEY_STDIN {
+        return Err(KeymanError::Input("invalid credential input"));
     }
+    parse_newkey_stdin(&input)?;
 
-    let content = format_credentials(b"mgla", &input[5..69])?;
     let skeleton = paths.read_skeleton()?;
     let suite = suite_password(paths, &skeleton)?;
-    let encrypted = encrypt_blob(&suite, &content)?;
-    let target = paths.checked_key_path(service)?;
-    write_new_exclusive(&target, &encrypted, "key file already exists")?;
+    let encrypted = encrypt_blob(&suite, &input)?;
+    if replace {
+        paths.write_key(service, &encrypted)?;
+    } else {
+        let target = paths.checked_key_path(service)?;
+        write_new_exclusive(&target, &encrypted, "key file already exists")?;
+    }
 
     let mut receipt = receipt_base("newkey");
     receipt.insert("service".into(), Value::String(service.to_owned()));
@@ -1865,7 +1898,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> (MGLA payload on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> [--replace] (credential body on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
 }
 
 fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
@@ -2018,13 +2051,23 @@ fn run(args: &mut [String]) -> Result<()> {
             emit_receipt(receipt);
             Ok(())
         }
+        "newkey" if args.len() == 4 && args[1] == "--stdin" && args[3] == "--replace" => {
+            let receipt = native_newkey_stdin(&paths, &args[2], true)?;
+            emit_receipt(receipt);
+            Ok(())
+        }
+        "newkey" if args.len() == 4 && args[1] == "--stdin" && args[2] == "--replace" => {
+            let receipt = native_newkey_stdin(&paths, &args[3], true)?;
+            emit_receipt(receipt);
+            Ok(())
+        }
         "newkey" if args.len() == 4 => {
             let receipt = native_newkey(&paths, &args[1], &args[2], &args[3])?;
             emit_receipt(receipt);
             Ok(())
         }
         "newkey" if args.len() == 3 && args[1] == "--stdin" => {
-            let receipt = native_newkey_stdin(&paths, &args[2])?;
+            let receipt = native_newkey_stdin(&paths, &args[2], false)?;
             emit_receipt(receipt);
             Ok(())
         }

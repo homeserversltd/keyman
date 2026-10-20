@@ -450,7 +450,7 @@ def keygen(service: str, paths: tuple[Path, Path, Path, Path, Path], binary: Pat
     with mgla_lock(skeleton):
         require_exchange(exchange)
         seed = bytearray(os.urandom(32))
-        payload = bytearray(b"mgla\n" + seed.hex().encode("ascii") + b"\n")
+        payload = bytearray(b'username="mgla"\npassword="' + seed.hex().encode("ascii") + b'"\n')
         try:
             run_keyman(binary, ["newkey", "--stdin", service], input_bytes=payload)
             private = make_private(seed)
