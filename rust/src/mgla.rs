@@ -419,7 +419,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "signal":result.as_ref().err().map(|error| error.message())});
         let mut encoded = line.to_string();
         encoded.push('\n');
-        let _ = io::stderr().lock().write_all(encoded.as_bytes());
+        // A failed deed sink is an I/O failure, even if public output or a
+        // mint already happened. Do not claim success or retry a broken sink.
+        io::stderr()
+            .lock()
+            .write_all(encoded.as_bytes())
+            .map_err(|_| KeymanError::Reported(2))?;
         // The deed already carries the named refusal; do not log it twice.
         result.map_err(|error| KeymanError::Reported(error.exit_code()))
     } else {
