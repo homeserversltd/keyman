@@ -36,8 +36,32 @@ and `new_password`. It validates and zeroizes the document, checks the current
 suite password before mutation, and emits a secret-free native receipt. The
 existing argv rotation forms remain unchanged.
 
-The Rust MGLA launcher exports its resolved, non-secret executable path to the
-Python front door as `KEYMAN_BINARY`. Direct Python MGLA may resolve the
+Rust `keyman mgla` implements `keygen SERVICE`, `keyline SERVICE`,
+`sign SERVICE`, `verify`, and `succeed OLD NEW` natively. It never starts
+Python or exports a seed. Credentials remain `username="mgla"` and a
+64-character lowercase hex seed as the password, encrypted by the ordinary
+Keyman service-key helpers. Seed buffers, credential plaintext, and the
+Ed25519 signing key are zeroized on drop, including refusal paths.
+
+`keygen` requires a TTY, refuses CI and existing services, and prints only
+`key=<id>` and the public MGLA-KEY1 line. `sign` accepts 1–64 LF-separated
+MGLA1 bodies, each at most 16 KiB, with an optional final LF; blank records,
+CR and non-printable bytes are refused. It decrypts once and validates every
+body and key id before signing or writing any output. Signatures cover the
+unchanged body bytes. Mint, sign, and succession emit one bounded metadata
+deed line to stderr; no body, seed or signature is logged. `keyline` and
+`verify` are reads and emit no deed line.
+
+`verify` needs neither a vault nor root. Stdin is a public MGLA-KEY1 line
+followed by one or more attestation lines. It prints VALID, INVALID with a
+reason, or UNKNOWN for other MGLA-family formats, as the white paper requires.
+Surrounding whitespace and NUL padding are ignored only by verification.
+Verification streams bounded records (64 KiB each); an oversized record is
+INVALID and does not prevent judging subsequent records. Exit is nonzero
+if any record is not VALID. `succeed` retains the old-key-signed MGLA-SUCC1
+grammar and refuses identical services or keys.
+
+The preserved direct Python MGLA entry may resolve the
 installed `runtime_dir/keyman` binary. A missing binary is refused as
 `keyman-rust-binary-missing`; there is no shell or C fallback. The Python
 installer builds with `Makefile.rust`, directs output to

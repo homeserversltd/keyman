@@ -29,10 +29,11 @@ generic `make`, the C binary, or a shell script. Runtime copying omits Rust
 target/cache directories. The retained installer option `--no-build-crypto`
 requires an already installed executable at the declared runtime path.
 
-The new MGLA path calls only `keyman newkey --stdin SERVICE` and
-`keyman export --scoped SERVICE`; private seed bytes are stdin-only. The Rust
-MGLA launcher supplies its resolved non-secret binary path as `KEYMAN_BINARY`.
-Direct Python MGLA resolves only `runtime_dir/keyman`, and refuses with
+Rust `keyman mgla` now owns keygen, keyline, batch sign, verify and succeed
+in process. It uses the same encrypted service credential shape; private
+seeds are zeroized in memory and never exported to the exchange. The retained
+Python MGLA entry still uses native newkey/scoped export, resolves only
+`runtime_dir/keyman` (or an explicitly supplied `KEYMAN_BINARY`), and refuses with
 `keyman-rust-binary-missing` if it cannot. The installer seeds Caduceus through
 its existing `_write_encrypted_key` implementation, using the SHA-256 identity
 of raw skeleton-key bytes and the actual service-suite password; it does not

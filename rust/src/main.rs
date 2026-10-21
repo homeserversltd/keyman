@@ -15,6 +15,7 @@ use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
 mod crown;
+mod mgla;
 
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
 type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
@@ -42,6 +43,7 @@ enum KeymanError {
     Io(&'static str),
     Crypto,
     CrownExit(i32),
+    Reported(i32),
 }
 
 impl KeymanError {
@@ -51,7 +53,7 @@ impl KeymanError {
             Self::Io(_) => 2,
             Self::Input(_) => 3,
             Self::Usage(_) => 4,
-            Self::CrownExit(code) => *code,
+            Self::CrownExit(code) | Self::Reported(code) => *code,
         }
     }
 
@@ -59,7 +61,7 @@ impl KeymanError {
         match self {
             Self::Usage(message) | Self::Input(message) | Self::Io(message) => message,
             Self::Crypto => "cryptographic operation failed",
-            Self::CrownExit(_) => "",
+            Self::CrownExit(_) | Self::Reported(_) => "",
         }
     }
 }
@@ -1898,45 +1900,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> [--replace] (credential body on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
-}
-
-fn run_mgla_python(paths: &Paths, args: &[String]) -> Result<()> {
-    if paths.rooted && paths.root == Path::new("/") {
-        return Err(KeymanError::Input(
-            "KEYMAN_ROOT must not be filesystem root",
-        ));
-    }
-    let script = paths.fixed("vault/keyman/index.py");
-    let metadata = fs::symlink_metadata(&script)
-        .map_err(|_| KeymanError::Io("MGLA Python front door is missing"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(KeymanError::Io(
-            "MGLA Python front door is not a regular file",
-        ));
-    }
-    let executable = env::current_exe()
-        .and_then(|path| fs::canonicalize(path))
-        .map_err(|_| KeymanError::Io("keyman-rust-binary-missing"))?;
-    let executable_metadata = fs::metadata(&executable)
-        .map_err(|_| KeymanError::Io("keyman-rust-binary-missing"))?;
-    if !executable_metadata.is_file() {
-        return Err(KeymanError::Io("keyman-rust-binary-missing"));
-    }
-    let status = Command::new("python3")
-        .arg(&script)
-        .args(args)
-        .env("KEYMAN_BINARY", executable)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|_| KeymanError::Io("cannot invoke MGLA Python front door"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(KeymanError::Input("MGLA Python operation refused"))
-    }
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> [--replace] (credential body on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|verify|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
 }
 
 fn run_internal_cleanup(args: &[String]) -> Result<()> {
@@ -1998,6 +1962,10 @@ fn run(args: &mut [String]) -> Result<()> {
         println!("{}", usage());
         return Ok(());
     }
+    if args[0] == "mgla" {
+        // Verification has no vault or KEYMAN_ROOT dependency.
+        return mgla::run(&args[1..]);
+    }
     if crown::is_verb(args[0].as_str()) {
         return Err(KeymanError::CrownExit(crown::run(args)));
     }
@@ -2030,12 +1998,6 @@ fn run(args: &mut [String]) -> Result<()> {
         return Ok(());
     }
     let paths = Paths::from_environment()?;
-    if args[0] == "mgla" {
-        let mut python_args = Vec::with_capacity(args.len());
-        python_args.push("mgla".to_owned());
-        python_args.extend(args[1..].iter().cloned());
-        return run_mgla_python(&paths, &python_args);
-    }
     if args[0] == "crypto" {
         return run_crypto(&paths, &args[1..]);
     }
@@ -2118,7 +2080,7 @@ fn main() {
     }
     if let Err(error) = result {
         match error {
-            KeymanError::CrownExit(code) => std::process::exit(code),
+            KeymanError::CrownExit(code) | KeymanError::Reported(code) => std::process::exit(code),
             error => {
                 eprintln!("ERROR: {}", error.message());
                 std::process::exit(error.exit_code());
