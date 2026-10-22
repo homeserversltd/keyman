@@ -45,3 +45,5 @@ The eight scripts above, `keyman-crypto.c`, the legacy `Makefile`, and the
 tracked C binary are intentionally carried untouched. No new technology path
 falls back to them, and this map does not authorize deletion or rewriting of
 legacy field material.
+
+CI-only ci/release_publish.py and ci/github_latest.py now live in wukong-staff/ci/keyman/; inert tests/ now lives in wukong-staff/inert/keyman/tests/; all field-run files remain untouched.

@@ -3,16 +3,11 @@ when:
     branch: main
 
 steps:
-  - name: release-publish
+  - name: build-keyman
     image: git.home.arpa/homeserversltd/rust-house:house
-    environment:
-      FORGEJO_TOKEN:
-        from_secret: FORGEJO_TOKEN
     commands:
       - |
         set -eu
-        : "$${CI_COMMIT_SHA:?CI_COMMIT_SHA is required}"
-        : "$${CI_PIPELINE_URL:?CI_PIPELINE_URL is required}"
         python3 - <<'PY'
         import urllib.request
 
@@ -22,12 +17,19 @@ steps:
         with urllib.request.urlopen(request, timeout=30) as response:
             ca_bundle = response.read()
             if response.status < 200 or response.status >= 300 or not ca_bundle:
-                raise SystemExit("release-publish: CA bundle response was empty or unsuccessful")
+                raise SystemExit("build-keyman: CA bundle response was empty or unsuccessful")
         with open("/tmp/house-ca.pem", "wb") as bundle_file:
             bundle_file.write(ca_bundle)
         PY
         test -s /tmp/house-ca.pem
         export SSL_CERT_FILE=/tmp/house-ca.pem
+        mkdir -p .release
+        rustc_info=$(rustc -Vv)
+        rustc_version=$(printf '%s\n' "$rustc_info" | awk '/^release: / { print $2; count++ } END { if (count != 1) exit 1 }')
+        printf '%s\n' "$rustc_version" | awk -F. 'NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { exit 0 } { exit 1 }'
+        printf "%s\n" "$rustc_version" > .release/rustc-version
+        env_sha=$(printf '%s\n%s\n%s\n' "$rustc_info" "$(cargo -V)" x86_64-unknown-linux-gnu | sha256sum | cut -d' ' -f1)
+        printf "%s\n" "$env_sha" > .release/env-sha
         make -f Makefile.rust
         python3 - <<'PY'
         import hashlib
@@ -35,29 +37,29 @@ steps:
 
         binary = Path("dist/keyman-x86_64")
         if not binary.is_file() or not binary.stat().st_size:
-            raise SystemExit("release-publish: Rust build did not produce dist/keyman-x86_64")
+            raise SystemExit("build-keyman: Rust build did not produce dist/keyman-x86_64")
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
         Path("dist/keyman-x86_64.sha256").write_bytes(
             f"{digest}  keyman-x86_64\n".encode("ascii")
         )
         PY
-        python3 ci/release_publish.py \
-          --source-sha "$${CI_COMMIT_SHA}" \
-          --binary dist/keyman-x86_64 \
-          --sidecar dist/keyman-x86_64.sha256 \
-          --pipeline-url "$${CI_PIPELINE_URL}"
-  - name: github-latest-keyman
+  - name: pool-publish-keyman
     image: python:3.12-alpine
-    failure: ignore
     environment:
       FORGEJO_TOKEN:
         from_secret: FORGEJO_TOKEN
       GITHUB_TOKEN:
         from_secret: github_token
+      WUKONG_STAFF_SHA: 7e26bf7ee38460abc60a0c6ad1246065e1b9d8bf
     commands:
       - |
         set -eu
-        apk add git
+        apk add --no-cache git
+        umask 077
+        if [ -z "$${FORGEJO_TOKEN:-}" ]; then
+          echo "pool-publish-keyman: required secret FORGEJO_TOKEN is missing" >&2
+          exit 1
+        fi
         python3 - <<'PY'
         import urllib.request
 
@@ -67,13 +69,22 @@ steps:
         with urllib.request.urlopen(request, timeout=30) as response:
             ca_bundle = response.read()
             if response.status < 200 or response.status >= 300 or not ca_bundle:
-                raise SystemExit("github-latest-keyman: CA bundle response was empty or unsuccessful")
+                raise SystemExit("pool-publish-keyman: CA bundle response was empty or unsuccessful")
         with open("/tmp/house-ca.pem", "wb") as bundle_file:
             bundle_file.write(ca_bundle)
         PY
         test -s /tmp/house-ca.pem
         export SSL_CERT_FILE=/tmp/house-ca.pem
-        python3 ci/github_latest.py
+        export GIT_SSL_CAINFO=/tmp/house-ca.pem
+        export GIT_TERMINAL_PROMPT=0
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=credential.https://git.home.arpa.helper
+        export GIT_CONFIG_VALUE_0='!f() { if [ "$${1}" = get ]; then printf "username=x-token\npassword=%s\n" "$${FORGEJO_TOKEN}"; fi; }; f'
+        git clone --no-checkout --depth 1 https://git.home.arpa/HOMESERVERSLTD/wukong-staff.git wukong-staff
+        git -C wukong-staff fetch --depth 1 origin "$${WUKONG_STAFF_SHA}"
+        git -C wukong-staff checkout --detach "$${WUKONG_STAFF_SHA}"
+        test "$(git -C wukong-staff rev-parse HEAD)" = "$${WUKONG_STAFF_SHA}"
+        WUKONG_MEMBER_ROOT="$${PWD}" exec sh wukong-staff/ci/keyman/pipeline.sh
   - name: ci-outcome-keyman
     image: python:3.12-alpine
     backend_options:
