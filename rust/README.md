@@ -37,7 +37,7 @@ suite password before mutation, and emits a secret-free native receipt. The
 existing argv rotation forms remain unchanged.
 
 Rust `keyman mgla` implements `keygen SERVICE`, `keyline SERVICE`,
-`sign SERVICE`, `verify`, and `succeed OLD NEW` natively. It never starts
+`sign SERVICE`, `verify`, `license`, and `succeed OLD NEW` natively. It never starts
 Python or exports a seed. Credentials remain `username="mgla"` and a
 64-character lowercase hex seed as the password, encrypted by the ordinary
 Keyman service-key helpers. Seed buffers, credential plaintext, and the
@@ -60,6 +60,32 @@ Verification streams bounded records (64 KiB each); an oversized record is
 INVALID and does not prevent judging subsequent records. Exit is nonzero
 if any record is not VALID. `succeed` retains the old-key-signed MGLA-SUCC1
 grammar and refuses identical services or keys.
+
+`license` takes no arguments. Stdin contains exactly two LF-delimited public
+records: the MGLA1 identity line first, then its MGLA-KEY1 key line (the last
+LF is optional). It reuses the offline verifier, including key-id and
+Ed25519 signature checks. Invalid, missing, extra or oversized records refuse
+with `mgla-license-line-invalid` and no license output. Like `verify`, it does
+not read a vault, private key, or `KEYMAN_ROOT`.
+
+The binary discovers the running root filesystem UUID itself through fixed
+`/usr/bin/findmnt -n -o UUID --mountpoint /`, with an empty child environment;
+there is no UUID, serial, path or executable override. A missing UUID refuses
+with `mgla-license-drive-uuid-unavailable`. It reads only
+`/sys/class/dmi/id/board_serial` for the optional board serial and trims it.
+Unreadable or empty values, case-insensitive prefixes `default`, `to be
+filled`, `not specified`, `none`, `n/a`, `system serial`, and values made of
+one repeated character count as absent. It never reads product serial,
+product UUID, MAC, TPM, or drive hardware serials.
+
+Success prints only `license=<64 lowercase hex>` and LF. The hash is SHA-256
+of the UTF-8 bytes `drive=<uuid>\nboard=<serial or empty>\nline=<identity line>`,
+with actual LF separators and no final LF. The identity is literal input
+without its LF record delimiter; padding ignored during verification is not
+stripped from the hash. One bounded metadata deed goes to stderr, naming
+`board_serial_present` but never the UUID, serial, identity or license.
+Nothing is written to disk; there is no log file, receipt or state. This
+derives a drive-bound license, not a birth or a persisted stamp.
 
 The preserved direct Python MGLA entry may resolve the
 installed `runtime_dir/keyman` binary. A missing binary is refused as

@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -18,7 +19,7 @@ const MAX_VERIFY_LINE: usize = 64 * 1024;
 const FIELDS: [&str; 7] = [
     "product", "band", "licensee", "grant", "issued", "expiry", "key",
 ];
-const USAGE: &str = "Usage: keyman mgla keygen SERVICE | keyline SERVICE | sign SERVICE (1..64 LF-separated bodies on stdin) | verify (key line then attestations on stdin) | succeed OLD NEW";
+const USAGE: &str = "Usage: keyman mgla keygen SERVICE | keyline SERVICE | sign SERVICE (1..64 LF-separated bodies on stdin) | verify (key line then attestations on stdin) | license (identity line then key line on stdin; no arguments) | succeed OLD NEW";
 
 // The file itself is the lock seat: no extra file or exchange directory.
 fn lock(paths: &Paths) -> Result<File> {
@@ -367,8 +368,136 @@ fn verify() -> Result<()> {
     }
 }
 
+fn root_drive_uuid() -> Result<String> {
+    let unavailable = || KeymanError::Io("mgla-license-drive-uuid-unavailable");
+    // Ask the running mount table for /, not a drive model or hardware serial.
+    // A fixed executable and empty environment forbid PATH, LIBMOUNT_* and
+    // other caller overrides from supplying a different filesystem identity.
+    let mut child = Command::new("/usr/bin/findmnt")
+        .args(["-n", "-o", "UUID", "--mountpoint", "/"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| unavailable())?;
+    let mut bytes = Vec::new();
+    let read = match child.stdout.take() {
+        Some(output) => output.take(4097).read_to_end(&mut bytes),
+        None => Err(io::Error::other("missing mount output")),
+    };
+    if read.is_err() || bytes.len() > 4096 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(unavailable());
+    }
+    if !child.wait().map_err(|_| unavailable())?.success() {
+        return Err(unavailable());
+    }
+    let uuid = std::str::from_utf8(&bytes)
+        .map_err(|_| unavailable())?
+        .trim();
+    // One UUID of any filesystem technology; never guess a UUID or choose
+    // between multiple answers. Preserve its spelling, including case.
+    if uuid.is_empty() || !uuid.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(unavailable());
+    }
+    Ok(uuid.to_owned())
+}
+
+fn board_serial() -> Option<String> {
+    let mut bytes = Vec::new();
+    File::open("/sys/class/dmi/id/board_serial")
+        .ok()?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let serial = std::str::from_utf8(&bytes).ok()?.trim();
+    let lower = serial.to_ascii_lowercase();
+    if serial.is_empty()
+        || [
+            "default",
+            "to be filled",
+            "not specified",
+            "none",
+            "n/a",
+            "system serial",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || serial.chars().all(|character| Some(character) == serial.chars().next())
+    {
+        None
+    } else {
+        Some(serial.to_owned())
+    }
+}
+
+fn license() -> Result<()> {
+    let start = Instant::now();
+    let mut board_serial_present = false;
+    let result = (|| {
+        let invalid = || KeymanError::Input("mgla-license-line-invalid");
+        let mut reader = io::stdin().lock();
+        let (identity, identity_overflow) = record(&mut reader, MAX_VERIFY_LINE)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        let (key, key_overflow) = record(&mut reader, 256)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if identity_overflow
+            || key_overflow
+            || record(&mut reader, 1).map_err(|_| invalid())?.is_some()
+        {
+            return Err(invalid());
+        }
+        let public = parse_keyline(&key).map_err(|_| invalid())?;
+        if verify_line(&identity, &public) != "VALID" {
+            return Err(invalid());
+        }
+        // Verification alone strips padding. The hash binds the literal
+        // supplied identity bytes, excluding only the LF record delimiter.
+        std::str::from_utf8(&identity).map_err(|_| invalid())?;
+        let uuid = root_drive_uuid()?;
+        let board = board_serial();
+        board_serial_present = board.is_some();
+        let mut hash = Sha256::new();
+        hash.update(b"drive=");
+        hash.update(uuid.as_bytes());
+        hash.update(b"\nboard=");
+        hash.update(board.as_deref().unwrap_or("").as_bytes());
+        hash.update(b"\nline=");
+        hash.update(&identity);
+        emit(format!("license={:x}\n", hash.finalize()).as_bytes())
+    })();
+    // One metadata-only Canonical Log Line goes home on stderr. No UUID,
+    // board serial, identity line, license, credential or persistent state.
+    let line = serde_json::json!({"who":"keyman", "uid":unsafe {libc::geteuid()},
+        "verb":"mgla-license", "board_serial_present":board_serial_present,
+        "outcome":if result.is_ok() {"ok"} else {"refused"},
+        "duration_ms":start.elapsed().as_millis(),
+        "signal":result.as_ref().err().map(|error| error.message())});
+    let mut encoded = line.to_string();
+    encoded.push('\n');
+    io::stderr()
+        .lock()
+        .write_all(encoded.as_bytes())
+        .map_err(|_| KeymanError::Reported(2))?;
+    result.map_err(|error| KeymanError::Reported(error.exit_code()))
+}
+
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let action = args.first().map(String::as_str).unwrap_or("");
+    if action == "license" {
+        if args.len() != 1 {
+            return Err(KeymanError::Usage(USAGE));
+        }
+        // Like offline verification, this has no vault or KEYMAN_ROOT seat.
+        return license();
+    }
     if action == "verify" && args.len() == 1 {
         return verify();
     }
