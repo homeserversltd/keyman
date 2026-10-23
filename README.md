@@ -231,6 +231,47 @@ never fall back to live paths.
 
 ## Native credential doors
 
+### Guarded native keystartup
+
+`sudo /vault/keyman/keyman keystartup --automated` is the Rust door for
+`keystartup.sh`'s automated provisioning flow. `AUTOMATED_SETUP=1` is the same
+explicit opt-in. Without either, the verb warns loudly on stderr that it would
+overwrite the owner account's password with the skeleton key, returns a
+secret-free refusal JSON object and exits nonzero before creating anything.
+
+The opted-in verb creates missing `/root/key/skeleton.key`,
+`/vault/.keys/service_suite.key` and `/vault/.keys/nas.key`, mode `0600`.
+Both encrypted records use the skeleton password and are decrypted and compared
+against the complete expected username/password record on every run. Missing
+skeleton material alongside an existing suite or NAS key is refused, never
+regenerated. Existing invalid or rotated records are refused, not overwritten.
+Key directories stay mode `0700`; an exclusively owned exchange tmpfs exists
+only during the invocation and is unmounted and removed on success or failure.
+Plaintext credentials stay in zeroizing memory throughout.
+
+On a live root, the owner's current shadow credential is verified in process
+using the system's libxcrypt (`libcrypt.so.2` or `libcrypt.so.1`). Only when it
+differs is `chpasswd` invoked, with `owner:<skeleton>` plus LF on stdin and no
+secret arguments or output. It is re-verified afterward. Root, Samba, SSH and
+other credentials/settings are not changed. Legacy `DEFAULT_ROOT_PASSWORD`,
+`KEYMAN_MANUAL` and `TEST_FLAG` do not override the native verb's fixed intent.
+If `/deploy` already exists, `/deploy/password.txt` contains the skeleton plus
+LF with mode `0700`, owner `owner:owner`; an absent `/deploy` is not created.
+A complete repeat verifies keys and the owner password without rewriting keys,
+the password hash or an already-correct deploy file. No legacy script, C
+helper, OpenSSL executable or Python installer is invoked.
+
+For isolated proof, `KEYMAN_ROOT` must name an existing canonical absolute
+non-root directory. Keys, account-file lookups, exchange and deploy paths are
+resolved beneath it. The owner-password payload is prepared but `chpasswd`
+and shadow verification are deliberately skipped: receipts explicitly report
+`owner_password_skipped_rooted=true`, `owner_password_set=false` and
+`owner_password_verified=false`. `verified=true` establishes the scratch key
+records and exchange cleanup, not a live credential proof. Live verification
+belongs to an admitted test-arbiter birth. Every invocation returns one JSON
+object with creation, password, deploy-write, verification and failure fields,
+never secret bytes or secret digests. No receipt is persisted by the verb.
+
 The Rust binary retains the existing `keyman newkey SERVICE USER PASSWORD`
 argument form for compatibility. New technology can submit credentials through
 the bounded stdin door:

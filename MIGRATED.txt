@@ -8,7 +8,7 @@ MGLA band do not execute these scripts or the C helper.
 
 | Retained field file | New technology door |
 |---|---|
-| `keystartup.sh` | `python3 index.py install` for installer policy; Rust `keyman init` for native hierarchy initialization. |
+| `keystartup.sh` | Rust `keyman keystartup --automated` for the full automated skeleton/service_suite/NAS and owner-password flow (`AUTOMATED_SETUP=1` also opts in); `keyman init` remains hierarchy-only and `python3 index.py install` retains installer policy. |
 | `newkey.sh` | Rust `keyman newkey SERVICE USER PASSWORD` compatibility form; MGLA uses the bounded `keyman newkey --stdin SERVICE` form. |
 | `exportkey.sh` | Rust `keyman export --scoped SERVICE` for one-operation exports; unscoped `keyman export SERVICE` remains field compatibility with its existing cleanup timer. |
 | `deletekey.sh` | Rust `keyman delete SERVICE`. |

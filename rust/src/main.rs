@@ -15,6 +15,7 @@ use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
 mod crown;
+mod keystartup;
 mod mgla;
 
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
@@ -1900,7 +1901,7 @@ fn emit_receipt(value: Value) {
 }
 
 fn usage() -> &'static str {
-    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman newkey --stdin <service> [--replace] (credential body on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|verify|license|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
+    "Usage: keyman <init|newkey|export|delete|rotate-suite> ... | keyman keystartup --automated (native keystartup.sh door; AUTOMATED_SETUP=1 also opts in; OVERWRITES owner password with skeleton key) | keyman newkey --stdin <service> [--replace] (credential body on stdin) | keyman export --scoped <service> | keyman rotate-suite --stdin (JSON stdin) | keyman mgla <keygen|keyline|sign|verify|license|succeed> ... | keyman crypto <create|reencrypt|encrypt_suite_key> <input_file> | keyman crypto decrypt <input_file> <output_file> | keyman update-luks <nas|nas_backup> <old_password> <new_password> | keyman update-transmission <new_password> <username> | keyman key-status [--device /dev/path] | keyman create-key --target <vault|external|both> --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman update-key --device /dev/path --strategy <safe_rotation|replace_primary|flexible_addition> (JSON stdin) | keyman admin-password (JSON stdin)"
 }
 
 fn run_internal_cleanup(args: &[String]) -> Result<()> {
@@ -1965,6 +1966,9 @@ fn run(args: &mut [String]) -> Result<()> {
     if args[0] == "mgla" {
         // Verification has no vault or KEYMAN_ROOT dependency.
         return mgla::run(&args[1..]);
+    }
+    if args[0] == "keystartup" {
+        return keystartup::run(args);
     }
     if crown::is_verb(args[0].as_str()) {
         return Err(KeymanError::CrownExit(crown::run(args)));

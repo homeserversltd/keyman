@@ -1743,7 +1743,7 @@ fn exchange_lock(paths: &Paths) -> std::result::Result<File, &'static str> {
     Ok(file)
 }
 
-struct ExchangeSession {
+pub(crate) struct ExchangeSession {
     directory: PathBuf,
     mounted: bool,
     export_identity: Option<(PathBuf, u64, u64)>,
@@ -1751,7 +1751,7 @@ struct ExchangeSession {
 }
 
 impl ExchangeSession {
-    fn begin(paths: &Paths) -> std::result::Result<Self, &'static str> {
+    pub(crate) fn begin(paths: &Paths) -> std::result::Result<Self, &'static str> {
         paths
             .ensure_directories("mnt")
             .map_err(|_| "keyman-exchange-directory-failed")?;
@@ -1805,7 +1805,7 @@ impl ExchangeSession {
         Ok(Zeroizing::new(bytes))
     }
 
-    fn cleanup(&mut self) -> std::result::Result<(), &'static str> {
+    pub(crate) fn cleanup(&mut self) -> std::result::Result<(), &'static str> {
         let mut first_error = None;
         if let Some((path, device, inode)) = self.export_identity.take() {
             match secure_remove_if_identity(&path, device, inode) {
