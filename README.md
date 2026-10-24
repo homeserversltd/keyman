@@ -235,9 +235,9 @@ never fall back to live paths.
 
 `sudo /vault/keyman/keyman keystartup --automated` is the Rust door for
 `keystartup.sh`'s automated provisioning flow. `AUTOMATED_SETUP=1` is the same
-explicit opt-in. Without either, the verb warns loudly on stderr that it would
-overwrite the owner account's password with the skeleton key, returns a
-secret-free refusal JSON object and exits nonzero before creating anything.
+explicit opt-in. Without either, the verb returns a secret-free refusal JSON
+object and exits nonzero before creating anything. Its loud stderr warning names
+the automation opt-in and the default owner-password overwrite with the skeleton.
 
 The opted-in verb creates missing `/root/key/skeleton.key`,
 `/vault/.keys/service_suite.key` and `/vault/.keys/nas.key`, mode `0600`.
@@ -249,7 +249,7 @@ Key directories stay mode `0700`; an exclusively owned exchange tmpfs exists
 only during the invocation and is unmounted and removed on success or failure.
 Plaintext credentials stay in zeroizing memory throughout.
 
-On a live root, the owner's current shadow credential is verified in process
+By default, on a live root, the owner's shadow credential is verified in process
 using the system's libxcrypt (`libcrypt.so.2` or `libcrypt.so.1`). Only when it
 differs is `chpasswd` invoked, with `owner:<skeleton>` plus LF on stdin and no
 secret arguments or output. It is re-verified afterward. Root, Samba, SSH and
@@ -261,10 +261,23 @@ A complete repeat verifies keys and the owner password without rewriting keys,
 the password hash or an already-correct deploy file. No legacy script, C
 helper, OpenSSL executable or Python installer is invoked.
 
+For a lab debug birth that must preserve the existing owner password, use
+`keyman keystartup --automated --keep-owner-password`. The explicit
+`--keep-owner-password` flag skips only the owner-password step and the
+`/deploy/password.txt` write; missing keys are still created, both encrypted
+records are still verified, and exchange cleanup still runs. The receipt
+reports `owner_password_skipped_flag=true`, `owner_password_set=false`,
+`owner_password_verified=false` and `deploy_file_written=false`; `verified=true`
+does not claim owner-password verification in this mode. The flag does not set
+any lab password, imply a debug birth, or replace the automation opt-in:
+`--keep-owner-password` alone still refuses and warns without changing anything.
+The birth caller must select it explicitly on its debug path.
+
 For isolated proof, `KEYMAN_ROOT` must name an existing canonical absolute
 non-root directory. Keys, account-file lookups, exchange and deploy paths are
-resolved beneath it. The owner-password payload is prepared but `chpasswd`
-and shadow verification are deliberately skipped: receipts explicitly report
+resolved beneath it. Without `--keep-owner-password`, the owner-password payload
+is prepared but `chpasswd` and shadow verification are deliberately skipped:
+receipts explicitly report
 `owner_password_skipped_rooted=true`, `owner_password_set=false` and
 `owner_password_verified=false`. `verified=true` establishes the scratch key
 records and exchange cleanup, not a live credential proof. Live verification

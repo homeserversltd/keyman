@@ -23,6 +23,7 @@ struct Progress {
     owner_password_set: bool,
     owner_password_verified: bool,
     owner_password_skipped_rooted: bool,
+    owner_password_skipped_flag: bool,
     deploy_file_written: bool,
     verified: bool,
 }
@@ -37,6 +38,7 @@ impl Progress {
             "owner_password_set": self.owner_password_set,
             "owner_password_verified": self.owner_password_verified,
             "owner_password_skipped_rooted": self.owner_password_skipped_rooted,
+            "owner_password_skipped_flag": self.owner_password_skipped_flag,
             "deploy_file_written": self.deploy_file_written,
             "verified": self.verified, "first_missing_signal": error,
         })
@@ -50,17 +52,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             || env::var_os("AUTOMATED_SETUP").is_some_and(|value| value == "1");
         // This guard precedes even path resolution: refusal cannot create anything.
         if !automated {
-            eprintln!("WARNING: KEYSTARTUP REFUSED! This run would OVERWRITE the owner account's password with the skeleton key. Allow this only intentionally with --automated (or AUTOMATED_SETUP=1).");
+            eprintln!("WARNING: KEYSTARTUP REFUSED! By default, this run would OVERWRITE the owner account's password with the skeleton key. --keep-owner-password skips the owner/deploy steps but does not authorize provisioning. Allow this only intentionally with --automated (or AUTOMATED_SETUP=1).");
             return Err(KeymanError::Input("keystartup-automated-flag-required"));
         }
-        if !(args.len() == 1 || (args.len() == 2 && args[1] == "--automated")) {
-            return Err(KeymanError::Usage("keystartup-arguments-invalid"));
+        let mut automated_argument = false;
+        let mut keep_owner_password = false;
+        for arg in &args[1..] {
+            match arg.as_str() {
+                "--automated" if !automated_argument => automated_argument = true,
+                "--keep-owner-password" if !keep_owner_password => keep_owner_password = true,
+                _ => return Err(KeymanError::Usage("keystartup-arguments-invalid")),
+            }
         }
         if unsafe { libc::geteuid() } != 0 {
             return Err(KeymanError::Io("keystartup-requires-root"));
         }
         let paths = Paths::from_environment()?;
-        provision(&paths, &mut progress)
+        provision(&paths, keep_owner_password, &mut progress)
     })();
     match result {
         Ok(()) => {
@@ -109,7 +117,7 @@ fn ensure_credential(paths: &Paths, name: &str, skeleton: &[u8], created: &mut b
     Ok(())
 }
 
-fn provision(paths: &Paths, progress: &mut Progress) -> Result<()> {
+fn provision(paths: &Paths, keep_owner_password: bool, progress: &mut Progress) -> Result<()> {
     paths.ensure_key_directories()?;
     let key_directory = File::open(paths.fixed("root/key"))
         .map_err(|_| KeymanError::Io("keystartup-key-directory-unavailable"))?;
@@ -176,8 +184,12 @@ fn provision(paths: &Paths, progress: &mut Progress) -> Result<()> {
             &mut progress.created_service_suite,
         )?;
         ensure_credential(paths, "nas", &skeleton, &mut progress.created_nas)?;
-        set_owner_password(paths, &skeleton, progress)?;
-        write_deploy_password(paths, &skeleton, &mut progress.deploy_file_written)?;
+        if keep_owner_password {
+            progress.owner_password_skipped_flag = true;
+        } else {
+            set_owner_password(paths, &skeleton, progress)?;
+            write_deploy_password(paths, &skeleton, &mut progress.deploy_file_written)?;
+        }
         Ok(())
     })();
     // Cleanup errors must override success (and remain visible after partial writes).
